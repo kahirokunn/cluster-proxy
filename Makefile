@@ -130,6 +130,7 @@ client-gen:
 
 images:
 	$(CONTAINER_ENGINE) build \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
@@ -139,9 +140,11 @@ images-amd64:
 	$(CONTAINER_ENGINE) buildx build \
 		--platform linux/amd64 \
 		--load \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
+.PHONY: images-amd64
 
 ## Integration Testing
 
