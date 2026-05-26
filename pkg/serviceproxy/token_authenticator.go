@@ -23,8 +23,10 @@ var ErrTokenNotAuthenticated = errors.New("token not authenticated")
 // indicate the token was rejected by the authenticator. Observed from:
 //   - Kubernetes v1.35: "invalid bearer token"
 //   - OpenShift 4.x:    "[invalid bearer token, token lookup failed]"
+//   - Kubernetes authentication docs: "Credentials are expired"
 var authRejectionPatterns = []string{
 	"invalid bearer token",
+	"credentials are expired",
 }
 
 // isAuthRejection reports whether a TokenReview Status.Error indicates an

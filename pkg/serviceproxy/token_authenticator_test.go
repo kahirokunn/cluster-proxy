@@ -295,6 +295,10 @@ func TestTokenReviewAuthenticator_StatusError_KnownRejection(t *testing.T) {
 			name:        "OpenShift: invalid bearer token with token lookup failed",
 			statusError: "[invalid bearer token, token lookup failed]",
 		},
+		{
+			name:        "Kubernetes: expired credentials",
+			statusError: "Credentials are expired",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
