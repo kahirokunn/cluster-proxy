@@ -32,6 +32,7 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `proxyServer.entrypointLoadBalancer`    | Enable LoadBalancer for entrypoint | `false`                                         |
 | `proxyServer.entrypointAddress`         | Custom entrypoint address          | `""`                                            |
 | `proxyServer.port`                      | Proxy server port                  | `8091`                                          |
+| `installByPlacement.enabled`            | Install the add-on automatically via `ClusterManagementAddOn.spec.installStrategy.placements`; set to `false` to leave installation manual | `true` |
 | `installByPlacement.placementName`      | Placement name for installation    | `""`                                            |
 | `installByPlacement.placementNamespace` | Placement namespace                | `""`                                            |
 | `enableServiceProxy`                    | Enable user server deployment      | `false`                                         |

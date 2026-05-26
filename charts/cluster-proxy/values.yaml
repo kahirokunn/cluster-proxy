@@ -29,6 +29,7 @@ proxyServer:
   imagePullPolicy: IfNotPresent
 
 installByPlacement:
+  enabled: true
   placementName: ""
   placementNamespace: ""
 
