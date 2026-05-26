@@ -179,8 +179,8 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 		It("shoud watch", Label("configmap"), func() {
 			watch, err := clusterProxyKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Watch(context.TODO(), v1.ListOptions{})
 			Expect(err).To(BeNil())
+			defer watch.Stop()
 
-			// create a pod
 			_, err = hubKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Create(context.Background(), &corev1.ConfigMap{
 				ObjectMeta: v1.ObjectMeta{
 					Name: "cluster-proxy-test",
@@ -188,15 +188,17 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 			}, v1.CreateOptions{})
 			Expect(err).To(BeNil())
 
-			// check if r is create
-			select {
-			case <-watch.ResultChan():
-				// this chan shoud not receive any pod event before pod created
-				err := hubKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Delete(context.Background(), "cluster-proxy-test", metav1.DeleteOptions{})
-				Expect(err).To(BeNil())
-			default:
-				Fail("Failed to received a pod create event")
-			}
+			Eventually(func() bool {
+				select {
+				case <-watch.ResultChan():
+					return true
+				default:
+					return false
+				}
+			}, timeout, time.Second).Should(BeTrue())
+
+			err = hubKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Delete(context.Background(), "cluster-proxy-test", metav1.DeleteOptions{})
+			Expect(err).To(BeNil())
 		})
 	})
 
