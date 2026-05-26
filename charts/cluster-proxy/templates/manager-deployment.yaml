@@ -30,6 +30,11 @@ spec:
             - --enable-kube-api-proxy={{ .Values.enableKubeApiProxy }}
             - --enable-service-proxy={{ .Values.enableServiceProxy }}
             - --image-pull-policy={{ .Values.proxyServer.imagePullPolicy }}
+            {{- if .Values.metrics.enabled }}
+            - --metrics-bind-address=:{{ include "cluster-proxy.metricsPort" . }}
+            {{- else }}
+            - --metrics-bind-address=0
+            {{- end }}
             {{- if .Values.featureGates }}
             - --feature-gates=ClusterProfile={{ .Values.featureGates.clusterProfile | default false}}
             {{- end}}
@@ -46,3 +51,8 @@ spec:
             privileged: false
             runAsNonRoot: true
             readOnlyRootFilesystem: true
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ include "cluster-proxy.metricsPort" . }}
+          {{- end }}

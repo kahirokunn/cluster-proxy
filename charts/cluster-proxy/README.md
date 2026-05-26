@@ -35,6 +35,51 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `installByPlacement.placementName`      | Placement name for installation    | `""`                                            |
 | `installByPlacement.placementNamespace` | Placement namespace                | `""`                                            |
 | `enableServiceProxy`                    | Enable user server deployment      | `false`                                         |
+| `metrics.enabled`                       | Expose hub manager metrics and create the `cluster-proxy-addon-manager-metrics` Service | `true` |
+| `metrics.port`                          | Port the manager binds for `/metrics` (matches the Service `port` and `targetPort`)     | `58080` |
+| `metrics.serviceMonitor.enabled`        | Create a Prometheus Operator `ServiceMonitor` for the manager metrics Service (requires the `monitoring.coreos.com/v1` CRD) | `false` |
+| `metrics.serviceMonitor.labels`         | Extra labels added to the generated `ServiceMonitor` (e.g. for Prometheus selector matching) | `{}` |
+
+### Hub Manager Metrics
+
+The hub addon manager exposes Prometheus metrics on `/metrics`. Metrics are
+enabled by default and served on port `58080` over HTTP. The chart provisions a
+`ClusterIP` Service named `cluster-proxy-addon-manager-metrics` that selects the
+manager pods via the `open-cluster-management.io/addon=cluster-proxy` and
+`component=cluster-proxy-manager` labels.
+
+To disable the metrics endpoint and Service entirely:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.enabled=false
+```
+
+To change the port used by both the manager `--metrics-bind-address` flag and
+the Service:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.port=9090
+```
+
+#### Prometheus Operator ServiceMonitor
+
+When the Prometheus Operator is installed in the cluster (and the
+`monitoring.coreos.com/v1` `ServiceMonitor` CRD is available), set
+`metrics.serviceMonitor.enabled=true` to have the chart create a
+`ServiceMonitor` that scrapes the manager metrics Service over HTTP. Add
+selector labels via `metrics.serviceMonitor.labels` so your Prometheus instance
+picks the resource up:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.serviceMonitor.enabled=true \
+  --set metrics.serviceMonitor.labels.release=prometheus
+```
+
+The `ServiceMonitor` is only rendered when both `metrics.enabled` and
+`metrics.serviceMonitor.enabled` are `true`.
 
 ### User Server Configuration
 

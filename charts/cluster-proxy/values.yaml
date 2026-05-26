@@ -10,6 +10,13 @@ tag:
 # Number of replicas
 replicas: 1
 
+metrics:
+  enabled: true
+  port: 58080
+  serviceMonitor:
+    enabled: false
+    labels: {}
+
 spokeAddonNamespace: "open-cluster-management-cluster-proxy"
 
 proxyServerImage: quay.io/open-cluster-management/cluster-proxy
