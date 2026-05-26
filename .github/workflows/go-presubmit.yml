@@ -76,6 +76,70 @@ jobs:
       - name: integration
         run: make test-integration
 
+  helm-templates:
+    name: helm-templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: Install helm
+        uses: azure/setup-helm@v4
+      - name: Lint cluster-proxy chart
+        run: helm lint charts/cluster-proxy
+      - name: Lint addon-agent chart
+        run: |
+          helm lint pkg/proxyagent/agent/manifests/charts/addon-agent \
+            --set image=cluster-proxy --set tag=test
+      - name: Render manager metrics templates (defaults)
+        run: |
+          helm template smoke charts/cluster-proxy \
+            --show-only templates/manager-metrics.yaml >/dev/null
+      - name: Render manager metrics templates (ServiceMonitor enabled)
+        run: |
+          helm template smoke charts/cluster-proxy \
+            --show-only templates/manager-metrics.yaml \
+            --set metrics.serviceMonitor.enabled=true \
+            --set 'metrics.serviceMonitor.labels.release=kube-prometheus-stack' \
+            >/dev/null
+      - name: Render manual ClusterManagementAddOn install strategy
+        run: |
+          helm template smoke charts/cluster-proxy \
+            --show-only templates/clustermanagementaddon.yaml \
+            --set installByPlacement.enabled=false \
+            | grep -q "type: Manual"
+      - name: Render addon-agent metrics templates (Default mode)
+        run: |
+          helm template smoke pkg/proxyagent/agent/manifests/charts/addon-agent \
+            --show-only templates/agent-metrics.yaml \
+            --set image=cluster-proxy --set tag=test \
+            --set agentMetricsServiceEnabled=true \
+            --set agentServiceMonitorEnabled=true >/dev/null
+      - name: Render addon-agent metrics templates (Hosted mode)
+        run: |
+          set -euo pipefail
+          for enable_service_proxy in false true; do
+            echo "==> enableServiceProxy=${enable_service_proxy}"
+            helm template smoke pkg/proxyagent/agent/manifests/charts/addon-agent \
+              --show-only templates/agent-metrics.yaml \
+              --set image=cluster-proxy --set tag=test \
+              --set installMode=Hosted \
+              --set enableServiceProxy="${enable_service_proxy}" \
+              --set enableKubeApiProxy=true \
+              --set agentMetricsServiceEnabled=true \
+              --set agentServiceMonitorEnabled=true >/dev/null
+          done
+      - name: Render full hosted addon-agent chart
+        run: |
+          rendered="$(mktemp)"
+          helm template smoke pkg/proxyagent/agent/manifests/charts/addon-agent \
+            --set image=cluster-proxy --set tag=test \
+            --set installMode=Hosted \
+            --set enableServiceProxy=true \
+            --set enableKubeApiProxy=true >"${rendered}"
+          grep -q "name: cluster-proxy-proxy-agent" "${rendered}"
+          grep -q "addon.open-cluster-management.io/hosted-manifest-location: hosting" "${rendered}"
+          grep -q "name: cluster-proxy-service-relay" "${rendered}"
+
   e2e:
     name: e2e
     runs-on: ubuntu-latest
@@ -98,3 +162,30 @@ jobs:
         run: make setup-env-for-e2e && make deploy-cluster-proxy-e2e
       - name: Run e2e tests
         run: make test-e2e
+
+  e2e-hosted:
+    name: e2e-hosted
+    runs-on: ubuntu-latest
+    env:
+      CLUSTERADM_VERSION: v1.3.1
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: install Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install kind
+        uses: helm/kind-action@v1.10.0
+        with:
+          install_only: true
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+      - name: Install helm
+        uses: azure/setup-helm@v4
+      - name: Install clusteradm
+        run: |
+          curl -L "https://raw.githubusercontent.com/open-cluster-management-io/clusteradm/${CLUSTERADM_VERSION}/install.sh" \
+            | bash -s -- "${CLUSTERADM_VERSION}"
+      - name: Run hosted e2e tests
+        run: make test-e2e-hosted

@@ -4,6 +4,12 @@ IMAGE_REGISTRY_NAME ?= quay.io/open-cluster-management
 IMAGE_NAME = cluster-proxy
 IMAGE_TAG ?= latest
 E2E_TEST_CLUSTER_NAME ?= e2e
+E2E_HOSTED_HUB_CLUSTER_NAME ?= cluster-proxy-hosted-hub
+E2E_HOSTED_HOSTING_CLUSTER_NAME ?= cluster-proxy-hosted-hosting
+E2E_HOSTED_MANAGED_CLUSTER_NAME ?= cluster-proxy-hosted-managed
+E2E_HOSTED_WORK_DIR ?= _output/e2e-hosted
+E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT ?= 18090
+E2E_HOSTED_USER_SERVER_LOCAL_PORT ?= 19092
 CONTAINER_ENGINE ?= docker
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:crdVersions={v1},allowDangerousTypes=true,generateEmbeddedObjectMeta=true"
@@ -228,6 +234,54 @@ test-e2e: delete-e2e-image-from-kind build-e2e-image load-e2e-image-kind
 	     test/e2e/env/job.yaml | kubectl apply -f -
 	@./test/e2e/env/wait-for-job.sh cluster-proxy-e2e open-cluster-management-addon 1200
 .PHONY: test-e2e
+
+setup-env-for-e2e-hosted: images
+	@echo "Setting up environment for hosted e2e tests..."
+	CONTAINER_ENGINE=$(CONTAINER_ENGINE) \
+	IMAGE_REGISTRY_NAME=$(IMAGE_REGISTRY_NAME) \
+	IMAGE_NAME=$(IMAGE_NAME) \
+	IMAGE_TAG=$(IMAGE_TAG) \
+	HUB_CLUSTER_NAME=$(E2E_HOSTED_HUB_CLUSTER_NAME) \
+	HOSTING_CLUSTER_NAME=$(E2E_HOSTED_HOSTING_CLUSTER_NAME) \
+	MANAGED_CLUSTER_NAME=$(E2E_HOSTED_MANAGED_CLUSTER_NAME) \
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	./test/e2e/env/init-hosted.sh
+.PHONY: setup-env-for-e2e-hosted
+
+clean-e2e-hosted:
+	@echo "Cleaning up hosted e2e kind clusters..."
+	-kind delete cluster --name $(E2E_HOSTED_HUB_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_HOSTING_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_MANAGED_CLUSTER_NAME)
+	@workdir='$(E2E_HOSTED_WORK_DIR)'; \
+	if [ -z "$$workdir" ]; then \
+		echo "ERROR: E2E_HOSTED_WORK_DIR is empty; refusing rm -rf" >&2; \
+		exit 1; \
+	fi; \
+	case "$$workdir" in \
+		/|//|/.|/..|.|..) \
+			echo "ERROR: E2E_HOSTED_WORK_DIR='$$workdir' resolves to root or current/parent dir; refusing rm -rf" >&2; \
+			exit 1 ;; \
+		*[[:space:]]*) \
+			echo "ERROR: E2E_HOSTED_WORK_DIR='$$workdir' contains whitespace; refusing rm -rf to avoid unsafe word-splitting" >&2; \
+			exit 1 ;; \
+	esac; \
+	rm -rf -- "$$workdir"
+.PHONY: clean-e2e-hosted
+
+test-e2e-hosted: clean-e2e-hosted setup-env-for-e2e-hosted
+	@echo "Running hosted e2e tests..."
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	PROXY_ENTRYPOINT_LOCAL_PORT=$(E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT) \
+	USER_SERVER_LOCAL_PORT=$(E2E_HOSTED_USER_SERVER_LOCAL_PORT) \
+	./test/e2e/env/run-hosted.sh
+	@echo "Running hosted e2e cleanup tests..."
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	PROXY_ENTRYPOINT_LOCAL_PORT=$(E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT) \
+	USER_SERVER_LOCAL_PORT=$(E2E_HOSTED_USER_SERVER_LOCAL_PORT) \
+	HOSTED_LABEL_FILTER=hosted-cleanup \
+	./test/e2e/env/run-hosted.sh
+.PHONY: test-e2e-hosted
 
 # Rapid iteration workflow for e2e tests (cleans up everything first)
 # Use LABEL_FILTER to run specific tests, e.g.: make retest-e2e LABEL_FILTER="connectivity"

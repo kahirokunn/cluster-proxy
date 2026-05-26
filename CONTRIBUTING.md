@@ -58,3 +58,45 @@ Before submitting a PR, please perform the following steps:
 Use these make targets as the official test interface. A raw `go test ./...`
 does not include generated manifests, envtest asset setup, linting, or the e2e
 packaging used by CI.
+
+### Hosted e2e prerequisites
+
+`make test-e2e-hosted` provisions three kind clusters (hub, hosting, managed),
+builds the cluster-proxy container image via `make images`, and drives the
+hosted addon flow end-to-end. It runs the non-destructive hosted specs first
+and then runs the destructive `hosted-cleanup` spec as a final phase. Before
+running it locally, install:
+
+- `docker` with BuildKit enabled (the `cmd/Dockerfile` uses `--platform=$BUILDPLATFORM`,
+  which requires BuildKit; on Docker 23+ BuildKit is the default builder, on older
+  Docker daemons export `DOCKER_BUILDKIT=1`)
+- `kind`, `kubectl`, `helm`, `jq`, and `clusteradm`
+
+The target removes any leftover hosted kind clusters and the working directory
+before each run, so it is safe to re-invoke.
+
+### Hosted e2e knobs
+
+The following environment variables override defaults consumed by
+`make test-e2e-hosted` and the scripts under `test/e2e/env/`:
+
+- `IMAGE_REGISTRY_NAME`, `IMAGE_NAME`, `IMAGE_TAG`: image coordinates loaded
+  into every hosted kind cluster (defaults: `quay.io/open-cluster-management`,
+  `cluster-proxy`, `latest`)
+- `CONTAINER_ENGINE`: container build tool used by `make images` (default `docker`)
+- `E2E_HOSTED_HUB_CLUSTER_NAME`, `E2E_HOSTED_HOSTING_CLUSTER_NAME`,
+  `E2E_HOSTED_MANAGED_CLUSTER_NAME`: kind cluster names (defaults
+  `cluster-proxy-hosted-hub`, `cluster-proxy-hosted-hosting`,
+  `cluster-proxy-hosted-managed`)
+- `E2E_HOSTED_WORK_DIR`: scratch directory for kubeconfigs and the generated
+  `env` file (default `_output/e2e-hosted`)
+- `E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT`, `E2E_HOSTED_USER_SERVER_LOCAL_PORT`:
+  local ports used by the `kubectl port-forward` driving the hub services
+  (defaults `18090`, `19092`)
+- `HOSTED_LABEL_FILTER`: Ginkgo v2 label-filter expression passed to
+  `go test ./test/e2e` (default `hosted && !hosted-cleanup`); set it to a more
+  specific label such as `hosted-relay` to scope the run to a subset of hosted
+  specs, or `hosted-cleanup` to run only the final deletion/cleanup check.
+
+Use `make clean-e2e-hosted` to tear down hosted kind clusters and the working
+directory between runs.
