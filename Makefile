@@ -122,19 +122,27 @@ client-gen:
  	-g lister-gen \
  	--versions=open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1
 
+# cmd/Dockerfile uses BuildKit-only features (FROM --platform=$BUILDPLATFORM and the
+# auto-populated TARGETOS/TARGETARCH ARGs), so the build must run under BuildKit/buildx.
+# DOCKER_BUILDKIT=1 enables BuildKit when CONTAINER_ENGINE=docker; podman builds
+# honor the same syntax natively.
 images:
-	$(CONTAINER_ENGINE) build \
+	DOCKER_BUILDKIT=1 $(CONTAINER_ENGINE) build \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
+.PHONY: images
 
 images-amd64:
 	$(CONTAINER_ENGINE) buildx build \
 		--platform linux/amd64 \
 		--load \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
+.PHONY: images-amd64
 
 ## Integration Testing
 
