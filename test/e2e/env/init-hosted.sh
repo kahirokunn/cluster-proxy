@@ -14,6 +14,7 @@ IMAGE_REGISTRY_NAME="${IMAGE_REGISTRY_NAME:-quay.io/open-cluster-management}"
 IMAGE_NAME="${IMAGE_NAME:-cluster-proxy}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE="${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE:-false}"
 
 HUB_NAMESPACE="open-cluster-management-addon"
 ADDON_NAMESPACE="open-cluster-management-cluster-proxy"
@@ -24,6 +25,7 @@ PROXY_ENTRYPOINT_NODE_PORT="30091"
 PROXY_SERVER_NODE_PORT="30090"
 HOSTING_MANIFEST_FINALIZER="addon.open-cluster-management.io/hosting-manifests-cleanup"
 HOSTING_PRE_DELETE_HOOK_FINALIZER="addon.open-cluster-management.io/hosting-addon-pre-delete"
+NO_WORKER_TAINT_KEY="cluster-proxy.open-cluster-management.io/no-worker"
 
 HUB_KUBECONFIG="${WORK_DIR}/hub.kubeconfig"
 HOSTING_KUBECONFIG="${WORK_DIR}/hosting.kubeconfig"
@@ -233,7 +235,8 @@ wait_addon_finalizer() {
 
 apply_hosted_addon_config() {
 	log "Applying hosted AddOnDeploymentConfig and ManagedClusterAddOn"
-	kubectl --kubeconfig "${HUB_KUBECONFIG}" apply -f - <<EOF
+	{
+		cat <<EOF
 apiVersion: addon.open-cluster-management.io/v1alpha1
 kind: AddOnDeploymentConfig
 metadata:
@@ -252,8 +255,14 @@ spec:
     value: 1h
   - name: managedKubeConfigRefreshBefore
     value: 5m
+EOF
+		if [[ "${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE}" != "true" ]]; then
+			cat <<EOF
   - name: additionalServiceCAConfigMap
     value: ${HTTPS_CA_CONFIGMAP}
+EOF
+		fi
+		cat <<EOF
 ---
 apiVersion: addon.open-cluster-management.io/v1alpha1
 kind: ManagedClusterAddOn
@@ -270,6 +279,7 @@ spec:
     namespace: ${MANAGED_CLUSTER_NAME}
     name: ${DEPLOY_CONFIG_NAME}
 EOF
+	} | kubectl --kubeconfig "${HUB_KUBECONFIG}" apply -f -
 }
 
 install_cluster_proxy() {
@@ -306,6 +316,11 @@ install_cluster_proxy() {
 }
 
 prepare_test_services() {
+	if [[ "${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE}" == "true" ]]; then
+		log "Skipping managed-cluster test services because workload scheduling is disabled"
+		return
+	fi
+
 	log "Deploying test services on managed cluster"
 	kubectl --kubeconfig "${MANAGED_KUBECONFIG}" apply -f "${ROOT_DIR}/test/e2e/env/hello-world.yaml"
 	kubectl --kubeconfig "${MANAGED_KUBECONFIG}" apply -f "${ROOT_DIR}/test/e2e/env/hello-world-https.yaml"
@@ -322,6 +337,17 @@ prepare_test_services() {
 			--from-file=service-ca.crt="${WORK_DIR}/hello-world-https-ca.crt" \
 			--dry-run=client -o yaml | kubectl --kubeconfig "${kubeconfig}" apply -f -
 	done
+}
+
+taint_managed_workload_nodes() {
+	if [[ "${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE}" != "true" ]]; then
+		return
+	fi
+
+	log "Tainting all managed cluster nodes to simulate no schedulable workload nodes"
+	kubectl --kubeconfig "${MANAGED_KUBECONFIG}" taint nodes --all \
+		"${NO_WORKER_TAINT_KEY}=true:NoSchedule" \
+		--overwrite
 }
 
 prepare_external_managed_kubeconfig() {
@@ -342,14 +368,21 @@ wait_hosted_addon_ready() {
 	wait_resource "${HOSTING_KUBECONFIG}" "deployment/cluster-proxy-managed-kubeconfig-provisioner -n ${ADDON_NAMESPACE}" 300
 	wait_resource "${HOSTING_KUBECONFIG}" "deployment/cluster-proxy-proxy-agent -n ${ADDON_NAMESPACE}" 300
 	wait_resource "${MANAGED_KUBECONFIG}" "deployment/cluster-proxy-service-relay -n ${ADDON_NAMESPACE}" 300
+	wait_resource "${MANAGED_KUBECONFIG}" "service/cluster-proxy-service-relay -n ${ADDON_NAMESPACE}" 300
+	wait_resource "${MANAGED_KUBECONFIG}" "role/cluster-proxy-service-relay-proxy -n ${ADDON_NAMESPACE}" 300
+	wait_resource "${MANAGED_KUBECONFIG}" "rolebinding/cluster-proxy-service-relay-proxy -n ${ADDON_NAMESPACE}" 300
 
 	wait_deployment "${HOSTING_KUBECONFIG}" "${ADDON_NAMESPACE}" cluster-proxy-managed-kubeconfig-provisioner 600s
 	wait_deployment "${HOSTING_KUBECONFIG}" "${ADDON_NAMESPACE}" cluster-proxy-proxy-agent 600s
-	wait_deployment "${MANAGED_KUBECONFIG}" "${ADDON_NAMESPACE}" cluster-proxy-service-relay 600s
 	wait_container_health "${HOSTING_KUBECONFIG}" "${ADDON_NAMESPACE}" deployment/cluster-proxy-proxy-agent proxy-agent 8093
 	wait_container_health "${HOSTING_KUBECONFIG}" "${ADDON_NAMESPACE}" deployment/cluster-proxy-proxy-agent service-proxy 8000
 	wait_container_health "${HOSTING_KUBECONFIG}" "${ADDON_NAMESPACE}" deployment/cluster-proxy-proxy-agent managed-apiserver-proxy 8001
-	wait_container_health "${MANAGED_KUBECONFIG}" "${ADDON_NAMESPACE}" deployment/cluster-proxy-service-relay service-relay 8000
+	if [[ "${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE}" == "true" ]]; then
+		log "Skipping service-relay availability wait because managed workload scheduling is disabled"
+	else
+		wait_deployment "${MANAGED_KUBECONFIG}" "${ADDON_NAMESPACE}" cluster-proxy-service-relay 600s
+		wait_container_health "${MANAGED_KUBECONFIG}" "${ADDON_NAMESPACE}" deployment/cluster-proxy-service-relay service-relay 8000
+	fi
 
 	log "Waiting for generated managed kubeconfig and addon availability"
 	wait_resource "${HOSTING_KUBECONFIG}" "secret/cluster-proxy-managed-kubeconfig -n ${ADDON_NAMESPACE}" 300
@@ -379,6 +412,7 @@ export E2E_HOSTED_DEPLOY_CONFIG_NAME="${DEPLOY_CONFIG_NAME}"
 export E2E_HOSTED_EXTERNAL_KUBECONFIG_SECRET="${EXTERNAL_KUBECONFIG_SECRET}"
 export E2E_HOSTED_HTTPS_CA_CONFIGMAP="${HTTPS_CA_CONFIGMAP}"
 export E2E_HOSTED_ADDON_NAMESPACE="${ADDON_NAMESPACE}"
+export E2E_HOSTED_NO_WORKER="${MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE}"
 EOF
 }
 
@@ -456,6 +490,7 @@ main() {
 	restart_ocm_deployments "${HOSTING_KUBECONFIG}"
 	wait_managed_cluster_available "${MANAGED_CLUSTER_NAME}"
 
+	taint_managed_workload_nodes
 	prepare_test_services
 	prepare_external_managed_kubeconfig
 	install_cluster_proxy

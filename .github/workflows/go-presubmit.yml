@@ -189,3 +189,5 @@ jobs:
             | bash -s -- "${CLUSTERADM_VERSION}"
       - name: Run hosted e2e tests
         run: make test-e2e-hosted
+      - name: Run hosted no-worker e2e tests
+        run: make test-e2e-hosted-no-worker

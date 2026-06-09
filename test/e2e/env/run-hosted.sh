@@ -10,7 +10,7 @@ fi
 ENV_FILE="${WORK_DIR}/env"
 PROXY_ENTRYPOINT_LOCAL_PORT="${PROXY_ENTRYPOINT_LOCAL_PORT:-18090}"
 USER_SERVER_LOCAL_PORT="${USER_SERVER_LOCAL_PORT:-19092}"
-HOSTED_LABEL_FILTER="${HOSTED_LABEL_FILTER:-hosted && !hosted-cleanup}"
+HOSTED_LABEL_FILTER="${HOSTED_LABEL_FILTER:-hosted && !hosted-cleanup && !hosted-no-worker}"
 HUB_NAMESPACE="open-cluster-management-addon"
 
 if [[ ! -f "${ENV_FILE}" ]]; then

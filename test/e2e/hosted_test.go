@@ -103,6 +103,73 @@ var _ = Describe("Hosted Mode", Label("hosted"), Ordered, func() {
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
+	It("should keep kube-apiserver proxy available without managed workload nodes", Label("hosted-no-worker"), func() {
+		if !hostedNoWorkerMode {
+			Skip("hosted no-worker mode is not configured")
+		}
+
+		By("Checking hosting cluster resources")
+		hostingDeploy := getDeployment(hostingKubeClient, managedClusterInstallNamespace, "cluster-proxy-proxy-agent")
+		Expect(containerNames(hostingDeploy)).To(ContainElement("service-proxy"))
+		getDeployment(hostingKubeClient, managedClusterInstallNamespace, "cluster-proxy-managed-kubeconfig-provisioner")
+		_, err := hostingKubeClient.CoreV1().Secrets(managedClusterInstallNamespace).Get(
+			context.Background(), managedKubeconfigSecretName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		expectDeploymentNotFound(hostingKubeClient, managedClusterInstallNamespace, serviceRelayName)
+
+		By("Checking managed cluster service-relay resources")
+		managedRelay := getDeployment(managedKubeClient, managedClusterInstallNamespace, serviceRelayName)
+		Expect(containerNames(managedRelay)).To(ContainElement("service-relay"))
+		Expect(managedRelay.Status.AvailableReplicas).To(Equal(int32(0)))
+		_, err = managedKubeClient.CoreV1().Services(managedClusterInstallNamespace).Get(
+			context.Background(), serviceRelayName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = managedKubeClient.CoreV1().ServiceAccounts(managedClusterInstallNamespace).Get(
+			context.Background(), "cluster-proxy", metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = managedKubeClient.RbacV1().Roles(managedClusterInstallNamespace).Get(
+			context.Background(), "cluster-proxy-service-relay-proxy", metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = managedKubeClient.RbacV1().RoleBindings(managedClusterInstallNamespace).Get(
+			context.Background(), "cluster-proxy-service-relay-proxy", metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		expectDeploymentNotFound(managedKubeClient, managedClusterInstallNamespace, "cluster-proxy-proxy-agent")
+		expectDeploymentNotFound(managedKubeClient, managedClusterInstallNamespace, "cluster-proxy-managed-kubeconfig-provisioner")
+
+		By("Checking service-relay Pods are unschedulable when created")
+		Eventually(func(g Gomega) {
+			pods, err := managedKubeClient.CoreV1().Pods(managedClusterInstallNamespace).List(
+				context.Background(), metav1.ListOptions{
+					LabelSelector: "proxy.open-cluster-management.io/component-name=service-relay",
+				})
+			g.Expect(err).ToNot(HaveOccurred())
+			for _, pod := range pods.Items {
+				g.Expect(pod.Status.Phase).To(Equal(corev1.PodPending))
+				g.Expect(podHasUnschedulableCondition(pod)).To(BeTrue(),
+					"expected service-relay pod %s/%s to be unschedulable", pod.Namespace, pod.Name)
+			}
+		}, time.Minute, 5*time.Second).Should(Succeed())
+
+		By("Checking addon conditions")
+		addon := &addonapiv1alpha1.ManagedClusterAddOn{}
+		Expect(hubRuntimeClient.Get(context.Background(), types.NamespacedName{
+			Namespace: managedClusterName,
+			Name:      "cluster-proxy",
+		}, addon)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(addon.Status.Conditions, addonapiv1alpha1.ManagedClusterAddOnConditionAvailable)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(addon.Status.Conditions, "ManagedKubeconfigReady")).To(BeTrue())
+
+		By("Checking kube-apiserver proxy with hub and managed tokens")
+		_, err = clusterProxyKubeClient.CoreV1().Pods(targetNamespace).List(context.Background(), metav1.ListOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = clusterProxyManagedClient.CoreV1().Pods(targetNamespace).List(context.Background(), metav1.ListOptions{})
+		Expect(err).ToNot(HaveOccurred())
+
+		By("Checking invalid tokens are rejected")
+		_, err = clusterProxyUnAuthClient.CoreV1().Pods(targetNamespace).List(context.Background(), metav1.ListOptions{})
+		Expect(apierrors.IsUnauthorized(err)).To(BeTrue())
+	})
+
 	It("should provision and refresh the managed kubeconfig", Label("hosted-relay", "managed-kubeconfig"), func() {
 		By("Checking generated managed kubeconfig Secret")
 		generated := getGeneratedManagedKubeconfig()
@@ -375,6 +442,17 @@ func containerHasVolumeMount(deploy *appsv1.Deployment, containerName, mountPath
 func deploymentHasVolume(deploy *appsv1.Deployment, name string) bool {
 	for _, volume := range deploy.Spec.Template.Spec.Volumes {
 		if volume.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func podHasUnschedulableCondition(pod corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled &&
+			condition.Status == corev1.ConditionFalse &&
+			condition.Reason == corev1.PodReasonUnschedulable {
 			return true
 		}
 	}

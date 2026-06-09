@@ -79,6 +79,7 @@ var (
 	podContainerName               string
 	podPort                        int
 	hostedMode                     bool
+	hostedNoWorkerMode             bool
 	targetNamespace                string
 	targetKubeClient               kubernetes.Interface
 	targetRuntimeClient            client.Client
@@ -108,6 +109,7 @@ var _ = BeforeSuite(func() {
 	err = func() error {
 		var err error
 		hostedMode = os.Getenv("E2E_HOSTING_KUBECONFIG") != "" || os.Getenv("E2E_MANAGED_KUBECONFIG") != ""
+		hostedNoWorkerMode = hostedMode && strings.EqualFold(os.Getenv("E2E_HOSTED_NO_WORKER"), "true")
 		managedClusterInstallNamespace = envOrDefault("E2E_HOSTED_ADDON_NAMESPACE", managedClusterInstallNamespace)
 
 		hubRESTConfig, err = configFromEnvOrInCluster("E2E_HUB_KUBECONFIG")
@@ -248,8 +250,14 @@ func checkAddonStatus() {
 			if err := deploymentAvailable(hostingKubeClient, managedClusterInstallNamespace, "cluster-proxy-managed-kubeconfig-provisioner"); err != nil {
 				return err
 			}
-			if err := deploymentAvailable(managedKubeClient, managedClusterInstallNamespace, "cluster-proxy-service-relay"); err != nil {
-				return err
+			if hostedNoWorkerMode {
+				if err := deploymentExists(managedKubeClient, managedClusterInstallNamespace, "cluster-proxy-service-relay"); err != nil {
+					return err
+				}
+			} else {
+				if err := deploymentAvailable(managedKubeClient, managedClusterInstallNamespace, "cluster-proxy-service-relay"); err != nil {
+					return err
+				}
 			}
 		} else {
 			// deployment on managedcluster is running
@@ -278,6 +286,15 @@ func deploymentAvailable(kubeClient kubernetes.Interface, namespace, name string
 		return fmt.Errorf("available replicas for %s should >= 1, but get %d", name, deploy.Status.AvailableReplicas)
 	}
 	return nil
+}
+
+func deploymentExists(kubeClient kubernetes.Interface, namespace, name string) error {
+	fmt.Fprintf(GinkgoWriter, "[DEBUG] Checking deployment exists: %s in namespace: %s\n", name, namespace)
+	_, err := kubeClient.AppsV1().Deployments(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		fmt.Fprintf(GinkgoWriter, "[ERROR] Failed to get deployment %s: %v\n", name, err)
+	}
+	return err
 }
 
 func prepareTestServiceAccount() {
@@ -424,6 +441,11 @@ func createTargetRoleBinding(name string, subject v1.Subject) {
 }
 
 func preparePodFortest() {
+	if hostedNoWorkerMode {
+		By("Skip hosted hello-world pod readiness because managed workloads are intentionally unschedulable")
+		return
+	}
+
 	if hostedMode {
 		By("Use the hosted hello-world pod for kube-apiserver proxy tests")
 		Eventually(func() error {
