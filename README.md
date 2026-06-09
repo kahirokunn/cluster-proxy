@@ -25,10 +25,12 @@ Cluster Proxy consists of two components:
 - **Addon-Agent**: Manages the installation of proxy agents for each managed 
   cluster.
 
-The overall architecture is shown below:
+## Architecture
 
-![Arch](./hack/picture/arch.png)
-
+See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the component layout,
+default mode and hosted mode request paths, ClusterProfile integration, and the
+expected hosted behavior before a managed cluster has schedulable workload
+nodes.
 
 ## Getting started
 
@@ -121,53 +123,28 @@ dialer of the Kubernetes client config object, e.g.:
 ### Hosted mode
 
 Cluster Proxy supports addon-framework hosted mode when the `ManagedClusterAddOn`
-has the `addon.open-cluster-management.io/hosting-cluster-name` annotation. In
-hosted mode the proxy-agent deployment runs on the hosting cluster, together
-with the addon namespace, the hosted `cluster-proxy` service account, and the
-Role/RoleBinding that grants leader-election access to leases and ConfigMaps in
-that namespace. The managed cluster keeps its own `cluster-proxy` service
-account plus a ClusterRole/Binding granting TokenReview and user/group
-impersonation against the managed apiserver, which the service-proxy and
-service relay rely on. Short-lived tokens for the managed service account are
-minted by the hosted provisioner via the external admin kubeconfig's
-TokenRequest subresource.
+has the `addon.open-cluster-management.io/hosting-cluster-name` annotation. See
+the [architecture guide](./docs/ARCHITECTURE.md#hosted-mode) for the hosted
+component placement and kube-apiserver versus Service request flow.
 
 The hosting cluster must contain an external managed-cluster kubeconfig Secret.
 By default the addon reads `external-managed-kubeconfig` from the namespace named
 after the managed cluster, creates short-lived tokens for the managed
 `cluster-proxy` service account, and writes a generated kubeconfig Secret named
 `cluster-proxy-managed-kubeconfig` in the addon install namespace. The generated
-kubeconfig is mounted read-only by the hosted agent containers; the external
+kubeconfig is mounted read-only by the hosted agent containers. The external
 admin kubeconfig is mounted only by the provisioner.
 
-#### External managed kubeconfig Secret contract
+The external Secret contract is:
 
-The operator is expected to provision the external managed-cluster kubeconfig
-Secret on the hosting cluster before the hosted `cluster-proxy` addon comes
-online. The provisioner reads the Secret named by
-`externalManagedKubeConfigSecretName` (default `external-managed-kubeconfig`)
-in the namespace named by `externalManagedKubeConfigSecretNamespace` (default:
-the managed cluster name) and applies the following contract:
-
-- **Secret type**: `Opaque` (any type whose `data` map can carry the key
-  below).
-- **Required key**: `kubeconfig`. The value must be a complete, self-contained
-  kubeconfig (PEM-inlined CA data or a CA reference that resolves inside the
-  provisioner pod) pointing at the managed cluster's kube-apiserver. A missing
-  or empty `kubeconfig` key causes the provisioner to fail the sync and patch
-  `ManagedKubeconfigReady=False` on the hub `ManagedClusterAddOn`.
-- **Embedded credential**: must authenticate as an identity on the managed
-  cluster that is authorized to `create` the `serviceaccounts/token`
-  subresource for the `cluster-proxy` ServiceAccount in the addon install
-  namespace (the namespace named by the addon's
-  `InstallStrategy`/`InstallSpec`, typically
-  `open-cluster-management-cluster-proxy`). The provisioner calls
-  `TokenRequest` against that ServiceAccount; any other verbs (`get`, `list`,
-  ...) on the managed cluster are not required.
-- **Lifecycle**: the Secret is read-only as far as the addon is concerned;
-  rotating the embedded credential is the operator's responsibility. When the
-  Secret contents change the provisioner detects the new SHA-256 hash and
-  re-issues a managed token within `managedKubeConfigSyncInterval`.
+- type `Opaque`
+- data key `kubeconfig`
+- a complete kubeconfig for the managed kube-apiserver
+- credentials authorized to `create` the `serviceaccounts/token` subresource for
+  the managed cluster `cluster-proxy` ServiceAccount in the addon install
+  namespace
+- operator-owned credential rotation; the addon detects Secret content changes
+  and refreshes the generated kubeconfig within `managedKubeConfigSyncInterval`
 
 The `cluster-proxy` ServiceAccount on the managed cluster is created by the
 addon-agent's own manifests and does not need to be pre-provisioned; only the
@@ -183,19 +160,6 @@ kubectl --kubeconfig <hosting-kubeconfig> -n <managed-cluster-name> \
   --from-file=kubeconfig=<path-to-managed-kubeconfig>
 ```
 
-Hosted mode supports the managed Kubernetes API proxy path. When
-`enableServiceProxy=true`, regular Service proxy traffic is always relayed
-through a managed-side `cluster-proxy-service-relay` Service via the managed
-kube-apiserver Service proxy subresource. This is required because the
-service-proxy container runs on the hosting cluster and cannot use managed
-cluster Service DNS names or ClusterIPs directly.
-
-| Mode | Kube API proxy | Regular Service proxy |
-|------|----------------|-----------------------|
-| Default | Supported | Supported when service proxy is enabled |
-| Hosted, `enableServiceProxy=false` | Supported | Disabled |
-| Hosted, `enableServiceProxy=true` | Supported | Supported through the managed-side `cluster-proxy-service-relay` Deployment and Service |
-
 The following `AddOnDeploymentConfig.spec.customizedVariables` are available for
 hosted mode:
 
@@ -205,61 +169,16 @@ hosted mode:
 - `managedKubeConfigTokenExpiration`: defaults to `24h`
 - `managedKubeConfigRefreshBefore`: defaults to `1h`
 - `managedKubeConfigSyncInterval`: defaults to `5m`
-- `serviceRelayName`: name of the managed-side relay Service/Deployment provisioned when `enableServiceProxy=true`; defaults to `cluster-proxy-service-relay`. The hosted service-proxy uses this name to build the managed-apiserver service-proxy URL, so it must match the relay Service name.
-- `serviceRelayPort`: port of the managed-side relay Service provisioned when `enableServiceProxy=true`; defaults to `7444`. The hosted service-proxy uses this port to build the managed-apiserver service-proxy URL, so it must match the relay Service port.
+- `serviceRelayName`: name of the managed-side relay Service/Deployment
+  provisioned when `enableServiceProxy=true`; defaults to
+  `cluster-proxy-service-relay`
+- `serviceRelayPort`: port of the managed-side relay Service provisioned when
+  `enableServiceProxy=true`; defaults to `7444`
 
 The hosted provisioner patches `ManagedKubeconfigReady` on the hub
 `ManagedClusterAddOn` and exposes health and metrics on `:8000`. The
 managed-apiserver raw TCP relay exposes health and metrics on `:8001`; the
 service relay exposes health and metrics on `:8000`.
-
-#### Recommended NetworkPolicy for the managed service-relay
-
-When hosted Service proxy is enabled, the managed-side `cluster-proxy-service-relay`
-Service is reachable inside the managed cluster on its ClusterIP. The relay
-itself enforces the trust boundary by TokenReview-ing the inbound caller token
-against the managed kube-apiserver and rejecting callers not in
-`--trusted-caller-username`, so a managed-cluster Pod that reaches the relay
-ClusterIP directly cannot use it as an open HTTP proxy. As a belt-and-braces
-defense, operators are expected to also apply a `NetworkPolicy` that restricts
-ingress to the relay Pod to traffic arriving via the managed kube-apiserver's
-`services/proxy` subresource. The chart does not ship this policy because the
-allowed source depends on how the managed cluster runs its kube-apiserver
-(host-network on control plane nodes vs. a labeled Pod in `kube-system`), and on
-which CNI is in use.
-
-A typical policy for a managed cluster where the kube-apiserver runs as
-host-network on control plane nodes selects the relay Pod by its component
-label and allows ingress only from the control plane node CIDR (substitute the
-real CIDR and addon install namespace for your environment):
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: cluster-proxy-service-relay
-  namespace: open-cluster-management-cluster-proxy
-spec:
-  podSelector:
-    matchLabels:
-      open-cluster-management.io/addon: cluster-proxy
-      proxy.open-cluster-management.io/component-name: service-relay
-  policyTypes:
-    - Ingress
-  ingress:
-    - from:
-        - ipBlock:
-            cidr: 10.0.0.0/24 # control plane node CIDR
-      ports:
-        - protocol: TCP
-          port: 7444 # matches serviceRelayPort
-```
-
-If the managed kube-apiserver runs as a regular Pod (for example in
-`kube-system` with a `component=kube-apiserver` label), replace the `ipBlock`
-peer with the corresponding `namespaceSelector` + `podSelector` peer. Adjust the
-addon install namespace, the `port` to match the configured `serviceRelayPort`,
-and any additional egress rules required by your CNI.
 
 ### Metrics
 
