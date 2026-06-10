@@ -2,6 +2,7 @@ package serviceproxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -77,8 +78,8 @@ type serviceProxy struct {
 	hubAuthenticator            authenticator.Token
 
 	// getImpersonateTokenFunc reads the service account token used for impersonation.
-	// Defaults to reading from the mounted service account token file.
-	// Can be overridden in tests.
+	// Defaults to reading the mounted service account token file, and Run swaps in
+	// the managed-kubeconfig reader when --managed-kubeconfig is set.
 	getImpersonateTokenFunc func() (string, error)
 }
 
@@ -129,11 +130,23 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	var err error
 	customChecks := []healthz.Checker{}
 
-	cc, err := addonutils.NewConfigChecker("cert", configCheckerFiles(s.cert, s.key, rootCAFile, s.hubKubeConfig, s.managedKubeConfig)...)
+	cc, err := addonutils.NewConfigChecker("cert", s.cert, s.key, rootCAFile, s.hubKubeConfig)
 	if err != nil {
 		return err
 	}
 	customChecks = append(customChecks, cc.Check)
+
+	// Watch the managed kubeconfig's endpoint and TLS material (read once at
+	// startup) but not its bearer token, which rotates routinely and is read
+	// fresh per request, so a rotation must not bounce the Pod. See
+	// managedKubeconfigReloadChecksum.
+	if s.hostedMode() {
+		managedKubeConfigChecker, err := newManagedKubeconfigReloadChecker(s.managedKubeConfig)
+		if err != nil {
+			return err
+		}
+		customChecks = append(customChecks, managedKubeConfigChecker)
+	}
 
 	if err := s.validate(); err != nil {
 		return err
@@ -156,22 +169,12 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 
 	// ca for accessing additional services
 	if s.additionalServiceCA != "" {
-		additionalCAPem, err := os.ReadFile(s.additionalServiceCA)
+		check, err := utils.AppendServiceCA(s.rootCAs, "additional-service-ca", s.additionalServiceCA)
 		if err != nil {
-			if os.IsNotExist(err) {
-				klog.Infof("additional-service-ca file not found: %s", s.additionalServiceCA)
-			} else {
-				return err
-			}
-		} else {
-			s.rootCAs.AppendCertsFromPEM(additionalCAPem)
-
-			// add configchecker into http probes when additional-service-ca is provided
-			cc, err := addonutils.NewConfigChecker("additional-service-ca", s.additionalServiceCA)
-			if err != nil {
-				return err
-			}
-			customChecks = append(customChecks, cc.Check)
+			return err
+		}
+		if check != nil {
+			customChecks = append(customChecks, check)
 		}
 	}
 
@@ -187,7 +190,7 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if s.managedKubeConfig != "" {
+	if s.hostedMode() {
 		managedAPIServerURL := managedConfig.Host
 		s.managedAPIServerURLTemplate, err = parseManagedAPIServerURL(managedAPIServerURL)
 		if err != nil {
@@ -202,6 +205,9 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		s.managedAPIServerTLSConfig, err = rest.TLSConfigFor(managedConfig)
 		if err != nil {
 			return fmt.Errorf("failed to build managed apiserver TLS config: %v", err)
+		}
+		if s.managedAPIServerTLSConfig != nil && s.managedAPIServerTLSConfig.MinVersion < tls.VersionTLS12 {
+			s.managedAPIServerTLSConfig.MinVersion = tls.VersionTLS12
 		}
 		s.relayURLTemplate, err = buildServiceRelayURL(managedAPIServerURL, podNamespace, s.serviceRelayName, s.serviceRelayPort)
 		if err != nil {
@@ -237,7 +243,7 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	// cluster s.managedClusterKubeClient targets, so watch it with an in-cluster
 	// client; in non-hosted mode the managed client already points there.
 	hostingKubeClient := s.managedClusterKubeClient
-	if s.managedKubeConfig != "" {
+	if s.hostedMode() {
 		hostingConfig, err := rest.InClusterConfig()
 		if err != nil {
 			return fmt.Errorf("failed to get in-cluster config for hosting cluster TLS ConfigMap watcher: %v", err)
@@ -316,7 +322,7 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		clone := *s.managedAPIServerURLTemplate
 		targetURL = &clone
 		targetsManagedAPIServer = true
-	} else if !isKubeAPIServer && s.managedKubeConfig != "" {
+	} else if !isKubeAPIServer && s.hostedMode() {
 		clone := *s.relayURLTemplate
 		targetURL = &clone
 		if err := s.prepareRelayRequest(req); err != nil {
@@ -395,15 +401,22 @@ func (s *serviceProxy) validate() error {
 	return nil
 }
 
+// hostedMode reports whether the service-proxy runs in hosted mode, where a
+// managed kubeconfig is set and requests are relayed to the managed cluster
+// instead of served directly from the in-cluster config.
+func (s *serviceProxy) hostedMode() bool {
+	return s.managedKubeConfig != ""
+}
+
 func (s *serviceProxy) metricsMode() string {
-	if s.managedKubeConfig != "" {
+	if s.hostedMode() {
 		return "Relay"
 	}
 	return "Direct"
 }
 
 func (s *serviceProxy) managedRESTConfig() (*rest.Config, error) {
-	if s.managedKubeConfig == "" {
+	if !s.hostedMode() {
 		config, err := rest.InClusterConfig()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get in-cluster config: %v", err)
@@ -418,14 +431,49 @@ func (s *serviceProxy) managedRESTConfig() (*rest.Config, error) {
 	return config, nil
 }
 
-func configCheckerFiles(files ...string) []string {
-	result := []string{}
-	for _, file := range files {
-		if file != "" {
-			result = append(result, file)
-		}
+// newManagedKubeconfigReloadChecker returns a health checker that reports
+// unhealthy once the managed kubeconfig's endpoint or TLS material changes from
+// the baseline captured at startup, restarting the Pod to pick it up. The
+// baseline is never updated (matching the reload=false config-checker semantics)
+// and excludes the bearer token (see managedKubeconfigReloadChecksum).
+func newManagedKubeconfigReloadChecker(path string) (healthz.Checker, error) {
+	baseline, err := managedKubeconfigReloadChecksum(path)
+	if err != nil {
+		return nil, err
 	}
-	return result
+	return func(_ *http.Request) error {
+		current, err := managedKubeconfigReloadChecksum(path)
+		if err != nil {
+			return err
+		}
+		if current != baseline {
+			return fmt.Errorf("managed kubeconfig endpoint or TLS material changed")
+		}
+		return nil
+	}, nil
+}
+
+// managedKubeconfigReloadChecksum hashes the parts of the managed kubeconfig
+// whose change requires a restart — the apiserver endpoint and the TLS trust
+// material (CA bundle, server name, client certs) — while excluding the bearer
+// token, which is refreshed routinely and read fresh on every request.
+func managedKubeconfigReloadChecksum(path string) ([32]byte, error) {
+	config, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	for _, authInfo := range config.AuthInfos {
+		if authInfo == nil {
+			continue
+		}
+		authInfo.Token = ""
+		authInfo.TokenFile = ""
+	}
+	raw, err := clientcmd.Write(*config)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(raw), nil
 }
 
 func appendRESTConfigCA(pool *x509.CertPool, config *rest.Config) error {
@@ -455,11 +503,7 @@ func appendRESTConfigCA(pool *x509.CertPool, config *rest.Config) error {
 // back to the in-cluster trust pool augmented with the additional service CA.
 func (s *serviceProxy) outboundTLSConfig(targetsManagedAPIServer bool) *tls.Config {
 	if targetsManagedAPIServer && s.managedAPIServerTLSConfig != nil {
-		cfg := s.managedAPIServerTLSConfig.Clone()
-		if cfg.MinVersion < tls.VersionTLS12 {
-			cfg.MinVersion = tls.VersionTLS12
-		}
-		return cfg
+		return s.managedAPIServerTLSConfig
 	}
 	return &tls.Config{
 		RootCAs:    s.rootCAs,
