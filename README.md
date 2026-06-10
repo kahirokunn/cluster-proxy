@@ -227,6 +227,72 @@ Because these objects follow their workloads, the `monitoring.coreos.com/v1`
 component runs: the hosting cluster for the agent and provisioner monitors, and
 the managed cluster for the service-relay monitor.
 
+### Recommended NetworkPolicy for the managed service-relay
+
+In hosted mode the managed-side service-relay Deployment receives hosted
+service-proxy traffic and forwards it to in-cluster Services. Its primary trust
+boundary is enforced in the relay binary via `TokenReview` against the managed
+kube-apiserver (see `--trusted-caller-username`), so a managed-cluster Pod that
+reaches the relay Service's ClusterIP directly cannot use it as an open HTTP
+proxy. The chart intentionally does not ship a `NetworkPolicy` because the only
+legitimate ingress source — the managed kube-apiserver — varies by cluster: it
+may run host-network on the control-plane nodes or as a labeled Pod in
+`kube-system`, and the policy that expresses "from the apiserver" depends on the
+cluster's CNI.
+
+As a belt-and-braces defense, operators are encouraged to restrict ingress to
+the relay Pod to traffic from the managed kube-apiserver. The relay Pod runs in
+the addon install namespace on the managed cluster and carries the labels
+`open-cluster-management.io/addon: cluster-proxy` and
+`proxy.open-cluster-management.io/component-name: service-relay`, and it listens
+on `serviceRelayPort` (default `7444`). A concrete example, where the managed
+kube-apiserver runs as a labeled Pod in `kube-system`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  # The addon install namespace on the managed cluster.
+  namespace: open-cluster-management-cluster-proxy
+  name: cluster-proxy-service-relay-allow-apiserver
+spec:
+  podSelector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      proxy.open-cluster-management.io/component-name: service-relay
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              component: kube-apiserver
+      ports:
+        - protocol: TCP
+          port: 7444
+```
+
+When the managed kube-apiserver runs host-network on the control-plane nodes,
+the apiserver's source IP is the node IP, which most CNIs treat as outside the
+Pod network. In that topology replace the `from` clause with an `ipBlock` that
+matches the control-plane node addresses, for example:
+
+```yaml
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/24 # control-plane node subnet
+      ports:
+        - protocol: TCP
+          port: 7444
+```
+
+Adjust the namespace, port, label selectors, and CIDR to match your environment.
+Enforcement requires a CNI that implements `NetworkPolicy`.
+
 ### Performance
 
 The following table shows network bandwidth benchmarking results via [goben](https://github.com/udhos/goben)
