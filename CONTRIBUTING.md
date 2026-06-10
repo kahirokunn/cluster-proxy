@@ -97,7 +97,8 @@ The following environment variables override defaults consumed by
   local ports used by the `kubectl port-forward` driving the hub services
   (defaults `18090`, `19092`)
 - `HOSTED_LABEL_FILTER`: Ginkgo v2 label-filter expression passed to
-  `go test ./test/e2e` (default `hosted && !hosted-cleanup`); set it to a more
+  `go test ./test/e2e` (default `hosted && !hosted-cleanup && !hosted-no-worker`);
+  set it to a more
   specific label such as `hosted-relay` to scope the run to a subset of hosted
   specs, or `hosted-cleanup` to run only the final deletion/cleanup check.
 
