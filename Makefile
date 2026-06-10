@@ -79,6 +79,58 @@ lint: ## Run golangci-lint against code.
 
 verify: fmt vet lint
 
+# Path to the addon-agent chart, reused by the Helm template checks below.
+ADDON_AGENT_CHART := pkg/proxyagent/agent/manifests/charts/addon-agent
+
+.PHONY: verify-helm-templates
+verify-helm-templates: ## Lint and render Helm charts (mirrors the CI helm-templates job).
+	@echo "Linting cluster-proxy chart..."
+	helm lint charts/cluster-proxy
+	@echo "Linting addon-agent chart..."
+	helm lint $(ADDON_AGENT_CHART) --set image=cluster-proxy --set tag=test
+	@echo "Rendering manager metrics templates (defaults)..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/manager-metrics.yaml >/dev/null
+	@echo "Rendering manager metrics templates (ServiceMonitor enabled)..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/manager-metrics.yaml \
+		--set metrics.serviceMonitor.enabled=true \
+		--set 'metrics.serviceMonitor.labels.release=kube-prometheus-stack' \
+		>/dev/null
+	@echo "Rendering manual ClusterManagementAddOn install strategy..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/clustermanagementaddon.yaml \
+		--set installByPlacement.enabled=false \
+		| grep -q "type: Manual"
+	@echo "Rendering addon-agent metrics templates (Default mode)..."
+	helm template smoke $(ADDON_AGENT_CHART) \
+		--show-only templates/agent-metrics.yaml \
+		--set image=cluster-proxy --set tag=test \
+		--set agentMetricsServiceEnabled=true \
+		--set agentServiceMonitorEnabled=true >/dev/null
+	@echo "Rendering addon-agent metrics templates (Hosted mode)..."
+	@set -e; for enable_service_proxy in false true; do \
+		echo "==> enableServiceProxy=$${enable_service_proxy}"; \
+		helm template smoke $(ADDON_AGENT_CHART) \
+			--show-only templates/agent-metrics.yaml \
+			--set image=cluster-proxy --set tag=test \
+			--set installMode=Hosted \
+			--set enableServiceProxy="$${enable_service_proxy}" \
+			--set enableKubeApiProxy=true \
+			--set agentMetricsServiceEnabled=true \
+			--set agentServiceMonitorEnabled=true >/dev/null; \
+	done
+	@echo "Rendering full hosted addon-agent chart..."
+	@set -e; rendered="$$(mktemp)"; \
+	helm template smoke $(ADDON_AGENT_CHART) \
+		--set image=cluster-proxy --set tag=test \
+		--set installMode=Hosted \
+		--set enableServiceProxy=true \
+		--set enableKubeApiProxy=true >"$${rendered}"; \
+	grep -q "name: cluster-proxy-proxy-agent" "$${rendered}"; \
+	grep -q "addon.open-cluster-management.io/hosted-manifest-location: hosting" "$${rendered}"; \
+	grep -q "name: cluster-proxy-service-relay" "$${rendered}"
+
 .PHONY: envtest-setup
 envtest-setup:
 	$(eval export KUBEBUILDER_ASSETS=$(shell curl -fsSL $(ENSURE_ENVTEST_SCRIPT) | bash))

@@ -50,6 +50,7 @@ Before submitting a PR, please perform the following steps:
 
 - Run `make build`.
 - Run `make verify`.
+- Run `make verify-helm-templates` for Helm chart changes (requires `helm`).
 - Run `make test`.
 - Run `make test-integration` for controller or manifest behavior changes.
 - Run `make test-e2e` for user-facing proxy behavior changes.
