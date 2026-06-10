@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"os"
 	"strings"
 	"time"
 
@@ -18,21 +17,16 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
-	addonutils "open-cluster-management.io/addon-framework/pkg/utils"
 	"open-cluster-management.io/cluster-proxy/pkg/constant"
 	addonmetrics "open-cluster-management.io/cluster-proxy/pkg/metrics"
 	"open-cluster-management.io/cluster-proxy/pkg/utils"
 )
 
 const (
-	// defaultTokenReviewCacheTTL deduplicates concurrent TokenReviews for the same
-	// bearer token; a short TTL still picks up token revocation quickly.
-	defaultTokenReviewCacheTTL = 10 * time.Second
-
-	// defaultKubeClientQPS and defaultKubeClientBurst raise the client-go defaults,
-	// which are too low for the relay's per-request TokenReview path.
-	defaultKubeClientQPS   = 50.0
-	defaultKubeClientBurst = 100
+	// serviceAccountCAFile is the managed cluster CA bundle mounted via the
+	// ServiceAccount token volume, trusted for outbound HTTPS so in-cluster
+	// Services need no explicit --additional-service-ca.
+	serviceAccountCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
 // ServiceRelay proxies requests from the hosted service-proxy to other
@@ -58,7 +52,7 @@ type ServiceRelay struct {
 func NewCommand() *cobra.Command {
 	relay := &ServiceRelay{
 		Listen:                 fmt.Sprintf(":%d", constant.ServiceRelayPort),
-		HealthProbeBindAddress: ":8000",
+		HealthProbeBindAddress: fmt.Sprintf(":%d", constant.ServiceRelayHealthProbePort),
 		TokenReviewCacheTTL:    utils.DefaultTokenReviewCacheTTL,
 		KubeClientQPS:          utils.DefaultKubeClientQPS,
 		KubeClientBurst:        utils.DefaultKubeClientBurst,
@@ -99,28 +93,24 @@ func (s *ServiceRelay) Run(ctx context.Context) error {
 	}
 
 	var customChecks []healthz.Checker
-	if s.AdditionalServiceCA != "" {
-		caData, err := os.ReadFile(s.AdditionalServiceCA)
+
+	// Trust the managed cluster CA and any additional service CA for outbound
+	// HTTPS. Each is wired into healthz so the relay restarts on rotation, since
+	// s.rootCAs is captured once at startup into s.transport.
+	serviceCAs := []struct{ name, path string }{
+		{"serviceaccount-ca", serviceAccountCAFile},
+		{"additional-service-ca", s.AdditionalServiceCA},
+	}
+	for _, ca := range serviceCAs {
+		if ca.path == "" {
+			continue
+		}
+		check, err := utils.AppendServiceCA(s.rootCAs, ca.name, ca.path)
 		if err != nil {
-			if os.IsNotExist(err) {
-				klog.Infof("additional-service-ca file not found: %s", s.AdditionalServiceCA)
-			} else {
-				return err
-			}
-		} else if ok := s.rootCAs.AppendCertsFromPEM(caData); !ok {
-			return fmt.Errorf("failed to parse additional service CA %s", s.AdditionalServiceCA)
-		} else {
-			// Wire the additional-service-ca file into the healthz endpoint
-			// so the kubelet's liveness probe restarts the relay when the
-			// mounted CA bundle changes. Without this, hosted Relay HTTPS
-			// backend CA rotations are not picked up until the Pod is
-			// restarted out-of-band, because s.rootCAs is captured once at
-			// startup into s.transport's TLS config.
-			cc, err := addonutils.NewConfigChecker("additional-service-ca", s.AdditionalServiceCA)
-			if err != nil {
-				return err
-			}
-			customChecks = append(customChecks, cc.Check)
+			return err
+		}
+		if check != nil {
+			customChecks = append(customChecks, check)
 		}
 	}
 
