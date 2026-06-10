@@ -54,6 +54,8 @@ Before submitting a PR, please perform the following steps:
 - Run `make test-integration` for controller or manifest behavior changes.
 - Run `make test-e2e` for user-facing proxy behavior changes.
 - Run `make test-e2e-hosted` for hosted-mode behavior changes.
+- Run `make test-e2e-hosted-no-worker` when changing how the agent behaves on a
+  managed cluster that has no schedulable worker nodes.
 
 Use these make targets as the official test interface. A raw `go test ./...`
 does not include generated manifests, envtest asset setup, linting, or the e2e
@@ -100,3 +102,35 @@ The following environment variables override defaults consumed by
 
 Use `make clean-e2e-hosted` to tear down hosted kind clusters and the working
 directory between runs.
+
+### Hosted no-worker e2e
+
+`make test-e2e-hosted-no-worker` runs the hosted flow against a managed cluster
+whose worker workloads are unschedulable, validating that the hosted
+kube-apiserver proxy stays available when the managed cluster exposes no
+schedulable worker nodes. It reuses the same prerequisites and scripts as
+`make test-e2e-hosted`, but provisions a dedicated set of kind clusters so it
+can run alongside the standard hosted target without colliding. Internally it
+sets `MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE=true` for `init-hosted.sh` and
+scopes the Ginkgo run to the `hosted-no-worker` label.
+
+The no-worker target reads its own override knobs (separate from the standard
+hosted target so both can coexist):
+
+- `E2E_HOSTED_NO_WORKER_HUB_CLUSTER_NAME`,
+  `E2E_HOSTED_NO_WORKER_HOSTING_CLUSTER_NAME`,
+  `E2E_HOSTED_NO_WORKER_MANAGED_CLUSTER_NAME`: kind cluster names (defaults
+  `cluster-proxy-hosted-no-worker-hub`,
+  `cluster-proxy-hosted-no-worker-hosting`,
+  `cluster-proxy-hosted-no-worker-managed`)
+- `E2E_HOSTED_NO_WORKER_WORK_DIR`: scratch directory for kubeconfigs and the
+  generated `env` file (default `_output/e2e-hosted-no-worker`)
+- `E2E_HOSTED_NO_WORKER_PROXY_ENTRYPOINT_LOCAL_PORT`,
+  `E2E_HOSTED_NO_WORKER_USER_SERVER_LOCAL_PORT`: local ports used by the
+  `kubectl port-forward` driving the hub services (defaults `18091`, `19093`)
+
+The shared `IMAGE_REGISTRY_NAME`, `IMAGE_NAME`, `IMAGE_TAG`, and
+`CONTAINER_ENGINE` knobs documented above apply here as well.
+
+Use `make clean-e2e-hosted-no-worker` to tear down the no-worker kind clusters
+and its working directory between runs.
