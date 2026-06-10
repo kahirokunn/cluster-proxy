@@ -1,23 +1,6 @@
 {{- if and .Values.enableServiceProxy (eq .Values.installMode "Hosted") }}
 {{- $enableAgentMetricsService := or (eq (toString .Values.agentMetricsServiceEnabled) "true") (eq (toString .Values.agentServiceMonitorEnabled) "true") -}}
 {{- $enableAgentServiceMonitor := eq (toString .Values.agentServiceMonitorEnabled) "true" -}}
-{{- $relayName := .Values.serviceRelayName | toString -}}
-{{- if eq $relayName "" -}}
-{{- fail "serviceRelayName must not be empty when hosted service proxy is enabled" -}}
-{{- end -}}
-{{- if gt (len $relayName) 63 -}}
-{{- fail (printf "serviceRelayName must be at most 63 characters (DNS-1035 label limit) when hosted service proxy is enabled; got %q (%d characters)" $relayName (len $relayName)) -}}
-{{- end -}}
-{{- if not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $relayName) -}}
-{{- fail (printf "serviceRelayName must be a valid DNS-1035 label (lowercase alphanumeric and '-', starting with a letter, not ending with '-') when hosted service proxy is enabled; got %q" $relayName) -}}
-{{- end -}}
-{{- $relayPortStr := .Values.serviceRelayPort | toString -}}
-{{- if not (regexMatch "^[1-9][0-9]*$" $relayPortStr) -}}
-{{- fail (printf "serviceRelayPort must be a positive integer between 1 and 65535 when hosted service proxy is enabled; got %q" $relayPortStr) -}}
-{{- end -}}
-{{- if gt (atoi $relayPortStr) 65535 -}}
-{{- fail (printf "serviceRelayPort must be between 1 and 65535 when hosted service proxy is enabled; got %s" $relayPortStr) -}}
-{{- end -}}
 # The relay is the managed-cluster receiver for hosted service-proxy traffic.
 # Its primary trust boundary is enforced in the relay binary via TokenReview
 # against the managed kube-apiserver (see --trusted-caller-username), so a

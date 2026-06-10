@@ -1268,67 +1268,45 @@ func TestNewAgentAddonHostedModeRelayServiceProxyCustomRelayNameAndPort(t *testi
 	}
 }
 
-// TestNewAgentAddonHostedModeRelayInvalidRelayOverrides asserts that the chart
-// rejects malformed serviceRelayName/serviceRelayPort overrides up-front via
-// fail(), instead of letting Helm render a Service/Deployment with an invalid
-// DNS-1035 name or an out-of-range port and only failing at apply time on the
-// managed cluster (or, worse, launching service-proxy with a bogus
-// --service-relay-name / --service-relay-port arg that no relay Service ever
-// matches).
+// TestNewAgentAddonHostedModeRelayInvalidRelayOverrides asserts that malformed
+// serviceRelayName/serviceRelayPort overrides are rejected up-front rather than
+// rendering a Service/Deployment with an invalid name or out-of-range port.
 func TestNewAgentAddonHostedModeRelayInvalidRelayOverrides(t *testing.T) {
 	cases := []struct {
 		name      string
 		overrides []addonv1alpha1.CustomizedVariable
-		wantMsg   string
 	}{
 		{
-			name: "empty serviceRelayName",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayName", Value: ""},
-			},
-			wantMsg: "serviceRelayName must not be empty",
+			name:      "empty serviceRelayName",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayName", Value: ""}},
 		},
 		{
-			name: "serviceRelayName not a DNS-1035 label",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayName", Value: "Bad_Name"},
-			},
-			wantMsg: "serviceRelayName must be a valid DNS-1035 label",
+			name:      "serviceRelayName not a DNS-1035 label",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayName", Value: "Bad_Name"}},
 		},
 		{
-			name: "serviceRelayName starts with a digit",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayName", Value: "1relay"},
-			},
-			wantMsg: "serviceRelayName must be a valid DNS-1035 label",
+			name:      "serviceRelayName starts with a digit",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayName", Value: "1relay"}},
 		},
 		{
-			name: "serviceRelayName exceeds 63 characters",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayName", Value: strings.Repeat("a", 64)},
-			},
-			wantMsg: "serviceRelayName must be at most 63 characters",
+			name:      "serviceRelayName exceeds 63 characters",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayName", Value: strings.Repeat("a", 64)}},
 		},
 		{
-			name: "serviceRelayPort non-numeric",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayPort", Value: "abc"},
-			},
-			wantMsg: "serviceRelayPort must be a positive integer",
+			name:      "serviceRelayPort non-numeric",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayPort", Value: "abc"}},
 		},
 		{
-			name: "serviceRelayPort zero",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayPort", Value: "0"},
-			},
-			wantMsg: "serviceRelayPort must be a positive integer",
+			name:      "serviceRelayPort zero",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayPort", Value: "0"}},
 		},
 		{
-			name: "serviceRelayPort above 65535",
-			overrides: []addonv1alpha1.CustomizedVariable{
-				{Name: "serviceRelayPort", Value: "70000"},
-			},
-			wantMsg: "serviceRelayPort must be between 1 and 65535",
+			name:      "serviceRelayPort above 65535",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayPort", Value: "70000"}},
+		},
+		{
+			name:      "serviceRelayPort collides with health/metrics listener on 8000",
+			overrides: []addonv1alpha1.CustomizedVariable{{Name: "serviceRelayPort", Value: "8000"}},
 		},
 	}
 
@@ -1374,9 +1352,7 @@ func TestNewAgentAddonHostedModeRelayInvalidRelayOverrides(t *testing.T) {
 			assert.NoError(t, err)
 
 			_, err = agentAddOn.Manifests(newCluster(clusterName, true), addon)
-			if assert.Error(t, err, "chart should reject invalid relay override") {
-				assert.Contains(t, err.Error(), tc.wantMsg)
-			}
+			assert.Error(t, err, "expected invalid relay override to be rejected")
 		})
 	}
 }

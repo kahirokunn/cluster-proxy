@@ -33,6 +33,7 @@ import (
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
 	"open-cluster-management.io/cluster-proxy/pkg/common"
 	"open-cluster-management.io/cluster-proxy/pkg/config"
+	"open-cluster-management.io/cluster-proxy/pkg/constant"
 	"open-cluster-management.io/cluster-proxy/pkg/proxyserver/operator/authentication/selfsigned"
 	"open-cluster-management.io/cluster-proxy/pkg/util"
 )
@@ -375,6 +376,10 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnD
 		}
 		values[agentServiceMonitorLabelsVariable] = labels
 
+		if err := validateServiceRelayOverrides(values); err != nil {
+			return nil, err
+		}
+
 		if config.Spec.NodePlacement != nil {
 			values["nodeSelector"] = config.Spec.NodePlacement.NodeSelector
 			values["tolerations"] = config.Spec.NodePlacement.Tolerations
@@ -397,6 +402,26 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnD
 		}
 		return values, nil
 	}
+}
+
+// validateServiceRelayOverrides rejects malformed serviceRelayName/serviceRelayPort
+// overrides. The health/metrics listener port is reserved for the service-relay.
+func validateServiceRelayOverrides(values addonfactory.Values) error {
+	if name, ok := values["serviceRelayName"].(string); ok {
+		if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+			return fmt.Errorf("invalid serviceRelayName %q: %s", name, strings.Join(errs, "; "))
+		}
+	}
+	if portStr, ok := values["serviceRelayPort"].(string); ok {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid serviceRelayPort %q: must be an integer between 1 and 65535", portStr)
+		}
+		if port == constant.ServiceRelayHealthProbePort {
+			return fmt.Errorf("invalid serviceRelayPort %q: %d is reserved for the relay health/metrics listener", portStr, constant.ServiceRelayHealthProbePort)
+		}
+	}
+	return nil
 }
 
 func parseAgentServiceMonitorLabels(rawLabels string) (map[string]string, error) {
