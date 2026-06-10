@@ -133,7 +133,8 @@ after the managed cluster, creates short-lived tokens for the managed
 `cluster-proxy` service account, and writes a generated kubeconfig Secret named
 `cluster-proxy-managed-kubeconfig` in the addon install namespace. The generated
 kubeconfig is mounted read-only by the hosted agent containers. The external
-admin kubeconfig is mounted only by the provisioner.
+admin kubeconfig is never mounted; the provisioner reads it directly from the
+hosting cluster API.
 
 The external Secret contract is:
 
