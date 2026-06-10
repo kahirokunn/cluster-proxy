@@ -1172,6 +1172,46 @@ func TestNewAgentAddonHostedModeRelayServiceProxy(t *testing.T) {
 	assert.NotNil(t, serviceRelayRole)
 	assert.NotContains(t, serviceRelayRole.Annotations, addonv1alpha1.HostedManifestLocationAnnotationKey)
 
+	// The relay Pod runs under a dedicated least-privilege ServiceAccount so it
+	// does not inherit the cluster-proxy ServiceAccount's impersonation RBAC
+	// (cluster-proxy-addon-agent-impersonator). It only needs tokenreviews:create
+	// to authenticate inbound callers.
+	assert.Equal(t, "cluster-proxy-service-relay", serviceRelayDeploy.Spec.Template.Spec.ServiceAccountName,
+		"service-relay must run under its own least-privilege ServiceAccount, not the impersonation-capable cluster-proxy account")
+	assert.NotEqual(t, "cluster-proxy", serviceRelayDeploy.Spec.Template.Spec.ServiceAccountName)
+
+	relaySA := getServiceAccountByName(manifests, "cluster-proxy-service-relay")
+	assert.NotNil(t, relaySA, "dedicated relay ServiceAccount must be provisioned on the managed cluster")
+	assert.NotContains(t, relaySA.Annotations, addonv1alpha1.HostedManifestLocationAnnotationKey)
+
+	relayClusterRole := getClusterRoleByName(manifests, "cluster-proxy-service-relay")
+	assert.NotNil(t, relayClusterRole)
+	for _, rule := range relayClusterRole.Rules {
+		assert.NotContains(t, rule.Verbs, "impersonate",
+			"relay ClusterRole must not grant impersonation")
+		assert.NotContains(t, rule.Resources, "users")
+		assert.NotContains(t, rule.Resources, "groups")
+	}
+	relayClusterRoleBinding := getClusterRoleBindingByName(manifests, "cluster-proxy-service-relay:open-cluster-management-cluster-proxy")
+	assert.NotNil(t, relayClusterRoleBinding)
+	assert.Equal(t, "cluster-proxy-service-relay", relayClusterRoleBinding.RoleRef.Name)
+	relaySABound := false
+	for _, subject := range relayClusterRoleBinding.Subjects {
+		if subject.Kind == "ServiceAccount" && subject.Name == "cluster-proxy-service-relay" {
+			relaySABound = true
+		}
+	}
+	assert.True(t, relaySABound, "relay ServiceAccount must be bound to its dedicated ClusterRole")
+
+	// The relay SA must NOT be a subject of the impersonator binding.
+	impersonatorBinding := getClusterRoleBindingByName(manifests, "cluster-proxy-addon-agent-impersonator:open-cluster-management-cluster-proxy")
+	if impersonatorBinding != nil {
+		for _, subject := range impersonatorBinding.Subjects {
+			assert.NotEqual(t, "cluster-proxy-service-relay", subject.Name,
+				"relay ServiceAccount must not be granted impersonation RBAC")
+		}
+	}
+
 	serviceProxyServerCertSecret := getSecretByName(manifests, "cluster-proxy-service-proxy-server-certificates")
 	assert.NotNil(t, serviceProxyServerCertSecret)
 	assert.Equal(t, "hosting", serviceProxyServerCertSecret.Annotations[addonv1alpha1.HostedManifestLocationAnnotationKey])
@@ -1731,16 +1771,26 @@ func getAgentDeployment(manifests []runtime.Object) *appsv1.Deployment {
 	return nil
 }
 
-func getDeploymentByName(manifests []runtime.Object, name string) *appsv1.Deployment {
+// namedObject is satisfied by the typed API objects produced by Manifests().
+type namedObject interface {
+	runtime.Object
+	GetName() string
+}
+
+// getObjectByName returns the first manifest of type T whose name matches, or
+// the zero value (typed nil) if none match.
+func getObjectByName[T namedObject](manifests []runtime.Object, name string) T {
 	for _, manifest := range manifests {
-		switch obj := manifest.(type) {
-		case *appsv1.Deployment:
-			if obj.Name == name {
-				return obj
-			}
+		if obj, ok := manifest.(T); ok && obj.GetName() == name {
+			return obj
 		}
 	}
-	return nil
+	var zero T
+	return zero
+}
+
+func getDeploymentByName(manifests []runtime.Object, name string) *appsv1.Deployment {
+	return getObjectByName[*appsv1.Deployment](manifests, name)
 }
 
 func getContainer(deploy *appsv1.Deployment, name string) *corev1.Container {
@@ -1792,15 +1842,19 @@ func getVolumeSecretName(deploy *appsv1.Deployment, name string) string {
 }
 
 func getRoleByName(manifests []runtime.Object, name string) *rbacv1.Role {
-	for _, manifest := range manifests {
-		switch obj := manifest.(type) {
-		case *rbacv1.Role:
-			if obj.Name == name {
-				return obj
-			}
-		}
-	}
-	return nil
+	return getObjectByName[*rbacv1.Role](manifests, name)
+}
+
+func getServiceAccountByName(manifests []runtime.Object, name string) *corev1.ServiceAccount {
+	return getObjectByName[*corev1.ServiceAccount](manifests, name)
+}
+
+func getClusterRoleByName(manifests []runtime.Object, name string) *rbacv1.ClusterRole {
+	return getObjectByName[*rbacv1.ClusterRole](manifests, name)
+}
+
+func getClusterRoleBindingByName(manifests []runtime.Object, name string) *rbacv1.ClusterRoleBinding {
+	return getObjectByName[*rbacv1.ClusterRoleBinding](manifests, name)
 }
 
 func getKubeAPIServerExternalNameService(manifests []runtime.Object, clusterName string) *corev1.Service {
@@ -1818,16 +1872,7 @@ func getKubeAPIServerExternalNameService(manifests []runtime.Object, clusterName
 }
 
 func getServiceByName(manifests []runtime.Object, name string) *corev1.Service {
-	for _, manifest := range manifests {
-		switch obj := manifest.(type) {
-		case *corev1.Service:
-			if obj.Name == name {
-				return obj
-			}
-		}
-	}
-
-	return nil
+	return getObjectByName[*corev1.Service](manifests, name)
 }
 
 func getServiceMonitorByName(manifests []runtime.Object, name string) *unstructured.Unstructured {
@@ -1917,14 +1962,5 @@ func getCASecret(manifests []runtime.Object) *corev1.Secret {
 }
 
 func getSecretByName(manifests []runtime.Object, name string) *corev1.Secret {
-	for _, manifest := range manifests {
-		switch obj := manifest.(type) {
-		case *corev1.Secret:
-			if obj.Name == name {
-				return obj
-			}
-		}
-	}
-
-	return nil
+	return getObjectByName[*corev1.Secret](manifests, name)
 }

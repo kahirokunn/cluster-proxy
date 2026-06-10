@@ -48,6 +48,47 @@ subjects:
     name: cluster-proxy
     namespace: {{ .Release.Namespace }}
 ---
+# Dedicated least-privilege ServiceAccount for the relay Pod. The relay
+# authenticates every inbound caller by submitting its bearer token to the
+# managed kube-apiserver's TokenReview API (see the trust-boundary comment
+# above), so `tokenreviews: create` is the only managed-cluster permission the
+# relay Pod itself requires. Running the relay under the shared cluster-proxy
+# ServiceAccount would let it inherit that account's
+# cluster-proxy-addon-agent-impersonator ClusterRole (impersonate users/groups),
+# so a compromised relay Pod could impersonate arbitrary managed-cluster
+# identities. The dedicated account below carries no impersonation rights.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-proxy-service-relay
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  {{- if eq .Release.Namespace "open-cluster-management-agent-addon" }}
+  name: cluster-proxy-service-relay
+  {{- else }}
+  name: cluster-proxy-service-relay:{{ .Release.Namespace }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-proxy-service-relay
+subjects:
+  - kind: ServiceAccount
+    name: cluster-proxy-service-relay
+    namespace: {{ .Release.Namespace }}
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -80,7 +121,7 @@ spec:
         open-cluster-management.io/addon: cluster-proxy
         proxy.open-cluster-management.io/component-name: service-relay
     spec:
-      serviceAccountName: cluster-proxy
+      serviceAccountName: cluster-proxy-service-relay
       {{- if .Values.tolerations }}
       tolerations: {{ toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
