@@ -208,6 +208,25 @@ rendered into the addon install namespace when opted in via the following
   Prometheus `serviceMonitorSelector`). Each key must be a valid Kubernetes
   label key and each value a valid label value; defaults to empty.
 
+In hosted mode the same opt-in also renders metrics Services (and matching
+`ServiceMonitor`s when `agentServiceMonitorEnabled` is `"true"`) for the hosted
+provisioner and, when `enableServiceProxy=true`, the service relay. Each
+component scrapes `/metrics` on its `8000` port:
+
+- `cluster-proxy-managed-kubeconfig-provisioner-metrics`: scrapes the
+  managed-kubeconfig provisioner. Rendered only in hosted mode and, like the
+  provisioner itself, placed on the hosting cluster (it carries the
+  `addon.open-cluster-management.io/hosted-manifest-location: hosting`
+  annotation).
+- `cluster-proxy-service-relay-metrics`: scrapes the managed-side service
+  relay. Rendered only in hosted mode with `enableServiceProxy=true` and placed
+  on the managed cluster, alongside the relay Deployment.
+
+Because these objects follow their workloads, the `monitoring.coreos.com/v1`
+`ServiceMonitor` CRD must be installed on whichever cluster the matching
+component runs: the hosting cluster for the agent and provisioner monitors, and
+the managed cluster for the service-relay monitor.
+
 ### Performance
 
 The following table shows network bandwidth benchmarking results via [goben](https://github.com/udhos/goben)
