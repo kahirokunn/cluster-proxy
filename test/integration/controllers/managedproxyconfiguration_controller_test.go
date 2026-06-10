@@ -10,7 +10,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	addonv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
@@ -98,6 +100,35 @@ var _ = Describe("ManagedProxyConfigurationReconciler Test", func() {
 	})
 
 	Context("Deploy proxy server", func() {
+		It("Should reject unsupported toleration operators", func() {
+			invalidConfig := config.DeepCopy()
+			invalidConfig.ObjectMeta = metav1.ObjectMeta{
+				Name: "invalid-toleration-operator",
+			}
+			invalidConfig.Spec.ProxyServer.NodePlacement = proxyv1alpha1.NodePlacement{
+				Tolerations: proxyv1alpha1.Tolerations{
+					{
+						Key:      "test.io/noschedule",
+						Operator: corev1.TolerationOperator("Invalid"),
+						Value:    "noschedule",
+					},
+				},
+			}
+
+			err := ctrlClient.Create(ctx, invalidConfig)
+			Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an invalid error, got %v", err)
+		})
+
+		It("Should allow an empty toleration operator for compatibility", func() {
+			emptyOperatorConfig := newManagedProxyConfigurationWithTolerationOperator("empty-toleration-operator", "")
+
+			err := ctrlClient.Create(ctx, emptyOperatorConfig)
+			Expect(err).ToNot(HaveOccurred())
+
+			err = ctrlClient.Delete(ctx, emptyOperatorConfig)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
 		It("Should have a proxy server deployed correctly with default config", func() {
 			// Wait for reconcile done
 			Eventually(func() error {
@@ -146,7 +177,7 @@ var _ = Describe("ManagedProxyConfigurationReconciler Test", func() {
 
 		It("Should have a proxy server deployed correctly with node selector, toleration and replicas", func() {
 			nodeSelector := map[string]string{"dev": "prod"}
-			tolerations := []corev1.Toleration{
+			tolerations := proxyv1alpha1.Tolerations{
 				{
 					Key:      "test.io/noschedule",
 					Operator: corev1.TolerationOpEqual,
@@ -182,7 +213,7 @@ var _ = Describe("ManagedProxyConfigurationReconciler Test", func() {
 				if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.NodeSelector, nodeSelector) {
 					return fmt.Errorf("nodeSelect is not correct, got %v", deployment.Spec.Template.Spec.NodeSelector)
 				}
-				if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
+				if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations.ToCoreV1()) {
 					return fmt.Errorf("tolerations is not correct, got %v", deployment.Spec.Template.Spec.Tolerations)
 				}
 				if *deployment.Spec.Replicas != 1 {
@@ -193,3 +224,45 @@ var _ = Describe("ManagedProxyConfigurationReconciler Test", func() {
 		})
 	})
 })
+
+func newManagedProxyConfigurationWithTolerationOperator(name, operator string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "proxy.open-cluster-management.io/v1alpha1",
+			"kind":       "ManagedProxyConfiguration",
+			"metadata": map[string]interface{}{
+				"name": name,
+			},
+			"spec": map[string]interface{}{
+				"proxyServer": map[string]interface{}{
+					"image":     "cluster-proxy",
+					"namespace": "open-cluster-management-proxy",
+					"replicas":  int64(3),
+					"entrypoint": map[string]interface{}{
+						"type": string(proxyv1alpha1.EntryPointTypePortForward),
+					},
+					"nodePlacement": map[string]interface{}{
+						"tolerations": []interface{}{
+							map[string]interface{}{
+								"key":      "test.io/noschedule",
+								"operator": operator,
+								"value":    "noschedule",
+							},
+						},
+					},
+				},
+				"authentication": map[string]interface{}{
+					"signer": map[string]interface{}{
+						"type": string(proxyv1alpha1.SelfSigned),
+					},
+					"dump": map[string]interface{}{
+						"secrets": map[string]interface{}{},
+					},
+				},
+				"proxyAgent": map[string]interface{}{
+					"image": "cluster-proxy-agent",
+				},
+			},
+		},
+	}
+}
