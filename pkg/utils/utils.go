@@ -3,10 +3,12 @@ package utils
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+
+	addonutils "open-cluster-management.io/addon-framework/pkg/utils"
 )
 
 const (
@@ -28,7 +32,25 @@ const (
 	HeaderClusterProxyPort          = "Cluster-Proxy-Port"
 	HeaderClusterProxyAuthorization = "Cluster-Proxy-Authorization"
 	HeaderClusterProxyRelayAuth     = "Cluster-Proxy-Relay-Authorization"
+
+	// KubeAPIServerHost is the in-cluster host of the managed cluster's
+	// kube-apiserver. GetTargetServiceURLFromRequest produces it, and both
+	// service-proxy and service-relay branch on it to recognize kube-apiserver
+	// targets.
+	KubeAPIServerHost = "kubernetes.default.svc"
 )
+
+// BearerTokenFromHeader extracts the token from an Authorization-style header
+// value of the form "Bearer <token>". It returns an empty string when the value
+// is missing the bearer prefix. Both service-proxy and service-relay use it to
+// read incoming bearer tokens.
+func BearerTokenFromHeader(value string) string {
+	const prefix = "Bearer "
+	if len(value) <= len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(value[len(prefix):])
+}
 
 // TargetServiceConfig is a collection of data extrict from the request URL description the target service we can to access on the managed cluster.
 // There are 2 usages of it:
@@ -129,7 +151,7 @@ func GetTargetServiceURLFromRequest(req *http.Request) (*url.URL, error) {
 	var targetServiceURL string
 	// check if the request is meant to proxy to kube-apiserver
 	if proto == "https" && service == "kubernetes" && namespace == "default" && port == "443" {
-		targetServiceURL = "https://kubernetes.default.svc"
+		targetServiceURL = "https://" + KubeAPIServerHost
 	} else {
 		targetServiceURL = fmt.Sprintf("%s://%s.%s.svc:%s", proto, service, namespace, port)
 	}
@@ -181,6 +203,28 @@ func ServeHealthProbes(healthProbeBindAddress string, tlsConfig *tls.Config, cus
 	}
 	klog.Infof("heath probes server is running...")
 	return server.ListenAndServe()
+}
+
+// AppendServiceCA loads a PEM CA bundle from path into pool and, when the file
+// exists, returns a config checker so the process is restarted on rotation. A
+// missing file is logged and skipped (returns nil, nil).
+func AppendServiceCA(pool *x509.CertPool, name, path string) (healthz.Checker, error) {
+	caData, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.Infof("%s file not found, skipping: %s", name, path)
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !pool.AppendCertsFromPEM(caData) {
+		return nil, fmt.Errorf("failed to parse %s %s", name, path)
+	}
+	cc, err := addonutils.NewConfigChecker(name, path)
+	if err != nil {
+		return nil, err
+	}
+	return cc.Check, nil
 }
 
 // ResultFromStatus classifies an HTTP status code as "success" or "error"
