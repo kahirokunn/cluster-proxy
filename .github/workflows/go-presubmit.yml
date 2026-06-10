@@ -134,6 +134,13 @@ jobs:
         run: |
           curl -L "https://raw.githubusercontent.com/open-cluster-management-io/clusteradm/${CLUSTERADM_VERSION}/install.sh" \
             | bash -s -- "${CLUSTERADM_VERSION}"
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
       - name: Run hosted e2e tests
         run: make test-e2e-hosted
       - name: Run hosted no-worker e2e tests
