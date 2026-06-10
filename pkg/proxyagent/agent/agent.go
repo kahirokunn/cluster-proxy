@@ -16,8 +16,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -46,7 +49,15 @@ const (
 	// See more details: https://coredns.io/manual/setups/#recursive-resolver; https://github.com/golang/go/blob/6f445a9db55f65e55c5be29d3c506ecf3be37915/src/net/dnsclient_unix.go#L666
 	// The default value is "svc.cluster.local". We can also set a CustomizedVariables with key "serviceDomain" to overwrite it.
 	serviceDomain = "svc.cluster.local"
+
+	agentServiceMonitorLabelsVariable = "agentServiceMonitorLabels"
 )
+
+var serviceMonitorGVK = schema.GroupVersionKind{
+	Group:   "monitoring.coreos.com",
+	Version: "v1",
+	Kind:    "ServiceMonitor",
+}
 
 func NewAgentAddon(
 	signer selfsigned.SelfSigner,
@@ -88,6 +99,8 @@ func NewAgentAddon(
 	})
 
 	agentFactory := addonfactory.NewAgentAddonFactory(common.AddonName, FS, "manifests/charts/addon-agent").
+		WithScheme(newAgentScheme()).
+		WithAgentHostedModeEnabledOption().
 		WithAgentRegistrationOption(&agent.RegistrationOption{
 			CSRConfigurations: func(cluster *clusterv1.ManagedCluster, addon *addonv1alpha1.ManagedClusterAddOn) ([]addonv1alpha1.RegistrationConfig, error) {
 				return regConfigs, nil
@@ -105,6 +118,16 @@ func NewAgentAddon(
 							APIGroups: []string{"coordination.k8s.io"},
 							Verbs:     []string{"*"},
 							Resources: []string{"leases"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"get"},
+							Resources: []string{"managedclusteraddons"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"update"},
+							Resources: []string{"managedclusteraddons/status"},
 						},
 					},
 				}).
@@ -145,6 +168,12 @@ func NewAgentAddon(
 		WithAgentInstallNamespace(agentInstallNamespaceFunc(utils.NewAddOnDeploymentConfigGetter(addonClient)))
 
 	return agentFactory.BuildHelmAgentAddon()
+}
+
+func newAgentScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	s.AddKnownTypeWithName(serviceMonitorGVK, &unstructured.Unstructured{})
+	return s
 }
 
 // agentInstallNamespaceFunc returns namespace from AddonDeploymentConfig, and config.DefaultAddonInstallNamespace if
@@ -332,9 +361,19 @@ func removeDupAndSortServices(services []serviceToExpose) []serviceToExpose {
 func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 	return func(config addonv1alpha1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 		values := addonfactory.Values{}
+		agentServiceMonitorLabels := ""
 		for _, variable := range config.Spec.CustomizedVariables {
 			values[variable.Name] = variable.Value
+			if variable.Name == agentServiceMonitorLabelsVariable {
+				agentServiceMonitorLabels = variable.Value
+			}
 		}
+
+		labels, err := parseAgentServiceMonitorLabels(agentServiceMonitorLabels)
+		if err != nil {
+			return nil, err
+		}
+		values[agentServiceMonitorLabelsVariable] = labels
 
 		if config.Spec.NodePlacement != nil {
 			values["nodeSelector"] = config.Spec.NodePlacement.NodeSelector
@@ -358,4 +397,34 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnD
 		}
 		return values, nil
 	}
+}
+
+func parseAgentServiceMonitorLabels(rawLabels string) (map[string]string, error) {
+	labels := map[string]string{}
+	rawLabels = strings.TrimSpace(rawLabels)
+	if rawLabels == "" {
+		return labels, nil
+	}
+
+	for _, rawPair := range strings.Split(rawLabels, ",") {
+		rawKey, rawValue, ok := strings.Cut(rawPair, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s must be a comma-separated list of key=value pairs; got %q",
+				agentServiceMonitorLabelsVariable, rawPair)
+		}
+
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(rawValue)
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("%s contains invalid label key %q: %s",
+				agentServiceMonitorLabelsVariable, key, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			return nil, fmt.Errorf("%s contains invalid label value for key %q: %s",
+				agentServiceMonitorLabelsVariable, key, strings.Join(errs, "; "))
+		}
+		labels[key] = value
+	}
+
+	return labels, nil
 }

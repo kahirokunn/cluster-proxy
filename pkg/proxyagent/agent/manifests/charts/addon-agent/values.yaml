@@ -1,4 +1,5 @@
 clusterName: loopback
+installMode: Default
 
 agentDeploymentName: cluster-proxy-proxy-agent
 
@@ -10,6 +11,12 @@ registry: quay.io/open-cluster-management
 # Image of the cluster-gateway instances
 image: cluster-proxy
 
+# Image tag. Overridden by the addon controller, which parses the tag from
+# proxyAgentImage. Set here so that `helm template`/`helm lint` render the
+# managed-cluster manifests (proxy-agent, addon-agent, managed-kubeconfig
+# provisioner, service-relay) without requiring a --set tag override.
+tag: latest
+
 proxyAgentImage: quay.io/open-cluster-management/cluster-proxy:latest
 proxyAgentImagePullSecrets: []
 
@@ -19,6 +26,18 @@ replicas: 1
 spokeAddonNamespace: "open-cluster-management-cluster-proxy"
 additionalProxyAgentArgs: []
 additionalServiceProxyArgs: []
+
+externalManagedKubeConfigSecretNamespace: ""
+externalManagedKubeConfigSecretName: external-managed-kubeconfig
+managedKubeConfigSecret: cluster-proxy-managed-kubeconfig
+managedKubeConfigTokenExpiration: 24h
+managedKubeConfigRefreshBefore: 1h
+managedKubeConfigSyncInterval: 5m
+serviceRelayName: cluster-proxy-service-relay
+serviceRelayPort: 7444
+agentMetricsServiceEnabled: "false"
+agentServiceMonitorEnabled: "false"
+agentServiceMonitorLabels: ""
 
 agentDeploymentAnnotations: {}
 

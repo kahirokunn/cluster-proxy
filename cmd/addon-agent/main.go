@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
@@ -20,12 +21,14 @@ import (
 	"open-cluster-management.io/cluster-proxy/pkg/common"
 	"open-cluster-management.io/cluster-proxy/pkg/util"
 
+	"k8s.io/component-base/metrics/legacyregistry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
 var (
 	hubKubeconfig               string
+	spokeKubeconfig             string
 	clusterName                 string
 	proxyServerNamespace        string
 	enablePortForwardProxy      bool
@@ -69,6 +72,8 @@ func main() {
 	klog.InitFlags(flag.CommandLine)
 	flag.StringVar(&hubKubeconfig, "hub-kubeconfig", "",
 		"The kubeconfig to talk to hub cluster")
+	flag.StringVar(&spokeKubeconfig, "spoke-kubeconfig", "",
+		"The kubeconfig to talk to spoke/managed cluster. If empty, in-cluster config is used")
 	flag.StringVar(&clusterName, "cluster-name", "",
 		"The name of the managed cluster")
 	flag.StringVar(&proxyServerNamespace, "proxy-server-namespace", "open-cluster-management-addon",
@@ -88,7 +93,17 @@ func main() {
 	}
 	cfg.UserAgent = "proxy-agent-addon-agent"
 
-	spokeClient, err := kubernetes.NewForConfig(ctrl.GetConfigOrDie())
+	var spokeConfig *rest.Config
+	if spokeKubeconfig != "" {
+		spokeConfig, err = clientcmd.BuildConfigFromFlags("", spokeKubeconfig)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		spokeConfig = ctrl.GetConfigOrDie()
+	}
+	spokeConfig.UserAgent = "proxy-agent-addon-agent-spoke"
+	spokeClient, err := kubernetes.NewForConfig(spokeConfig)
 	if err != nil {
 		panic(fmt.Errorf("failed to create spoke client, err: %w", err))
 	}
@@ -97,21 +112,36 @@ func main() {
 		panic(fmt.Sprintf("Pod namespace is empty, please set the ENV for %s", envKeyPodNamespace))
 	}
 
+	leaseClient := spokeClient
+	leaseNamespace := addonAgentNamespace
+	useManagementLease := spokeKubeconfig != ""
+	if useManagementLease {
+		managementConfig := ctrl.GetConfigOrDie()
+		managementConfig.UserAgent = "proxy-agent-addon-agent-management"
+		leaseClient, err = kubernetes.NewForConfig(managementConfig)
+		if err != nil {
+			panic(fmt.Errorf("failed to create management client, err: %w", err))
+		}
+	}
+
 	var leaseUpdater lease.LeaseUpdater
 	if enableProxyAgentHealthCheck {
 		klog.Infof("Proxy-agent health check enabled, lease will only update when proxy-agent is connected")
 		leaseUpdater = lease.NewLeaseUpdater(
-			spokeClient,
+			leaseClient,
 			common.AddonName,
-			addonAgentNamespace,
+			leaseNamespace,
 			checkProxyAgentReadiness(),
-		).WithHubLeaseConfig(cfg, clusterName)
+		)
 	} else {
 		leaseUpdater = lease.NewLeaseUpdater(
-			spokeClient,
+			leaseClient,
 			common.AddonName,
-			addonAgentNamespace,
-		).WithHubLeaseConfig(cfg, clusterName)
+			leaseNamespace,
+		)
+	}
+	if !useManagementLease {
+		leaseUpdater = leaseUpdater.WithHubLeaseConfig(cfg, clusterName)
 	}
 
 	ctx := context.Background()
@@ -135,7 +165,11 @@ func main() {
 	}
 
 	// If the certificates is changed, we need to restart the agent to load the new certificates.
-	cc, err := addonutils.NewConfigChecker("certificates check", "/etc/tls/tls.crt", "/etc/tls/tls.key")
+	configFiles := []string{"/etc/tls/tls.crt", "/etc/tls/tls.key"}
+	if spokeKubeconfig != "" {
+		configFiles = append(configFiles, spokeKubeconfig)
+	}
+	cc, err := addonutils.NewConfigChecker("certificates check", configFiles...)
 	if err != nil {
 		klog.Fatalf("failed create certificates checker: %v", err)
 	}
@@ -160,6 +194,7 @@ func main() {
 func serveHealthProbes(stop <-chan struct{}, address string, healthCheckers map[string]healthz.Checker) {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: healthCheckers}))
+	mux.Handle("/metrics", legacyregistry.Handler())
 
 	server := http.Server{
 		Handler: mux,
