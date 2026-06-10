@@ -124,22 +124,17 @@ func main() {
 		}
 	}
 
-	var leaseUpdater lease.LeaseUpdater
+	var healthCheckFuncs []func() bool
 	if enableProxyAgentHealthCheck {
 		klog.Infof("Proxy-agent health check enabled, lease will only update when proxy-agent is connected")
-		leaseUpdater = lease.NewLeaseUpdater(
-			leaseClient,
-			common.AddonName,
-			leaseNamespace,
-			checkProxyAgentReadiness(),
-		)
-	} else {
-		leaseUpdater = lease.NewLeaseUpdater(
-			leaseClient,
-			common.AddonName,
-			leaseNamespace,
-		)
+		healthCheckFuncs = append(healthCheckFuncs, checkProxyAgentReadiness())
 	}
+	leaseUpdater := lease.NewLeaseUpdater(
+		leaseClient,
+		common.AddonName,
+		leaseNamespace,
+		healthCheckFuncs...,
+	)
 	if !useManagementLease {
 		leaseUpdater = leaseUpdater.WithHubLeaseConfig(cfg, clusterName)
 	}
