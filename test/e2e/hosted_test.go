@@ -143,6 +143,8 @@ var _ = Describe("Hosted Mode", Label("hosted"), Ordered, func() {
 					LabelSelector: "proxy.open-cluster-management.io/component-name=service-relay",
 				})
 			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(pods.Items).ToNot(BeEmpty(),
+				"expected at least one pending service-relay pod before asserting unschedulability")
 			for _, pod := range pods.Items {
 				g.Expect(pod.Status.Phase).To(Equal(corev1.PodPending))
 				g.Expect(podHasUnschedulableCondition(pod)).To(BeTrue(),
