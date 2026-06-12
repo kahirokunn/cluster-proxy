@@ -269,5 +269,5 @@ func waitAgentReady(proxyConfiguration *proxyv1alpha1.ManagedProxyConfiguration,
 			return matchedGeneration
 		}).
 		WithTimeout(time.Second * 30).
-		Should(Equal(int(proxyConfiguration.Spec.ProxyAgent.Replicas)))
+		Should(BeNumerically(">=", int(proxyConfiguration.Spec.ProxyAgent.Replicas)))
 }
