@@ -143,5 +143,8 @@ jobs:
           jq --version
       - name: Run hosted e2e tests
         run: make test-e2e-hosted
+      - name: Clean hosted e2e clusters
+        if: always()
+        run: make clean-e2e-hosted
       - name: Run hosted no-worker e2e tests
         run: make test-e2e-hosted-no-worker
