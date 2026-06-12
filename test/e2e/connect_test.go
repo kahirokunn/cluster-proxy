@@ -202,29 +202,36 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 
 	Describe("Execute in a pod", Label("exec"), func() {
 		It("should return hello", Label("pod-exec"), func() {
-			req := clusterProxyKubeClient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace(hubInstallNamespace).SubResource("exec").Param("container", "manager")
+			Eventually(func(g Gomega) string {
+				req := clusterProxyKubeClient.CoreV1().RESTClient().
+					Post().
+					Resource("pods").
+					Name(podName).
+					Namespace(hubInstallNamespace).
+					SubResource("exec").
+					Param("container", "manager")
+				req.VersionedParams(&corev1.PodExecOptions{
+					Command:   []string{"/bin/sh", "-c", "echo hello"},
+					Container: "manager",
+					Stdin:     false,
+					Stdout:    true,
+					Stderr:    true,
+					TTY:       false,
+				}, k8sscheme.ParameterCodec)
 
-			req.VersionedParams(&corev1.PodExecOptions{
-				Command:   []string{"/bin/sh", "-c", "echo hello"},
-				Container: "manager",
-				Stdin:     false,
-				Stdout:    true,
-				Stderr:    true,
-				TTY:       false,
-			}, k8sscheme.ParameterCodec)
+				exec, err := remotecommand.NewSPDYExecutor(clusterProxyCfg, "POST", req.URL())
+				g.Expect(err).To(BeNil())
 
-			exec, err := remotecommand.NewSPDYExecutor(clusterProxyCfg, "POST", req.URL())
-			Expect(err).To(BeNil())
-
-			var stdout, stderr bytes.Buffer
-			err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
-				Stdin:  nil,
-				Stdout: &stdout,
-				Stderr: &stderr,
-				Tty:    false,
-			})
-			Expect(err).To(BeNil())
-			Expect(strings.Contains(stdout.String(), "hello")).To(Equal(true))
+				var stdout, stderr bytes.Buffer
+				err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+					Stdin:  nil,
+					Stdout: &stdout,
+					Stderr: &stderr,
+					Tty:    false,
+				})
+				g.Expect(err).To(BeNil(), stderr.String())
+				return stdout.String()
+			}).WithTimeout(time.Second * 30).Should(ContainSubstring("hello"))
 		})
 	})
 
