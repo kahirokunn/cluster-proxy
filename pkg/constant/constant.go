@@ -5,9 +5,18 @@ const (
 
 	ServiceProxyPort = 7443
 
+	ServiceRelayPort = 7444
+
+	// ServiceRelayHealthProbePort is the port the service-relay health/metrics
+	// listener binds to. It is reserved and cannot be used as the relay's
+	// serviceRelayPort.
+	ServiceRelayHealthProbePort = 8000
+
 	ServerCertSecretName = "cluster-proxy-service-proxy-server-cert"
 
 	ServiceProxyName = "cluster-proxy-service-proxy"
+
+	ServiceRelayName = "cluster-proxy-service-relay"
 
 	AddonName = "cluster-proxy"
 

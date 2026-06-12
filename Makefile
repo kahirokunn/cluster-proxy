@@ -4,6 +4,18 @@ IMAGE_REGISTRY_NAME ?= quay.io/open-cluster-management
 IMAGE_NAME = cluster-proxy
 IMAGE_TAG ?= latest
 E2E_TEST_CLUSTER_NAME ?= e2e
+E2E_HOSTED_HUB_CLUSTER_NAME ?= cluster-proxy-hosted-hub
+E2E_HOSTED_HOSTING_CLUSTER_NAME ?= cluster-proxy-hosted-hosting
+E2E_HOSTED_MANAGED_CLUSTER_NAME ?= cluster-proxy-hosted-managed
+E2E_HOSTED_WORK_DIR ?= _output/e2e-hosted
+E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT ?= 18090
+E2E_HOSTED_USER_SERVER_LOCAL_PORT ?= 19092
+E2E_HOSTED_NO_WORKER_HUB_CLUSTER_NAME ?= cluster-proxy-hosted-no-worker-hub
+E2E_HOSTED_NO_WORKER_HOSTING_CLUSTER_NAME ?= cluster-proxy-hosted-no-worker-hosting
+E2E_HOSTED_NO_WORKER_MANAGED_CLUSTER_NAME ?= cluster-proxy-hosted-no-worker-managed
+E2E_HOSTED_NO_WORKER_WORK_DIR ?= _output/e2e-hosted-no-worker
+E2E_HOSTED_NO_WORKER_PROXY_ENTRYPOINT_LOCAL_PORT ?= 18091
+E2E_HOSTED_NO_WORKER_USER_SERVER_LOCAL_PORT ?= 19093
 CONTAINER_ENGINE ?= docker
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:crdVersions={v1},allowDangerousTypes=true,generateEmbeddedObjectMeta=true"
@@ -67,6 +79,58 @@ lint: ## Run golangci-lint against code.
 
 verify: fmt vet lint
 
+# Path to the addon-agent chart, reused by the Helm template checks below.
+ADDON_AGENT_CHART := pkg/proxyagent/agent/manifests/charts/addon-agent
+
+.PHONY: verify-helm-templates
+verify-helm-templates: ## Lint and render Helm charts (mirrors the CI helm-templates job).
+	@echo "Linting cluster-proxy chart..."
+	helm lint charts/cluster-proxy
+	@echo "Linting addon-agent chart..."
+	helm lint $(ADDON_AGENT_CHART) --set image=cluster-proxy --set tag=test
+	@echo "Rendering manager metrics templates (defaults)..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/manager-metrics.yaml >/dev/null
+	@echo "Rendering manager metrics templates (ServiceMonitor enabled)..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/manager-metrics.yaml \
+		--set metrics.serviceMonitor.enabled=true \
+		--set 'metrics.serviceMonitor.labels.release=kube-prometheus-stack' \
+		>/dev/null
+	@echo "Rendering manual ClusterManagementAddOn install strategy..."
+	helm template smoke charts/cluster-proxy \
+		--show-only templates/clustermanagementaddon.yaml \
+		--set installByPlacement.enabled=false \
+		| grep -q "type: Manual"
+	@echo "Rendering addon-agent metrics templates (Default mode)..."
+	helm template smoke $(ADDON_AGENT_CHART) \
+		--show-only templates/agent-metrics.yaml \
+		--set image=cluster-proxy --set tag=test \
+		--set agentMetricsServiceEnabled=true \
+		--set agentServiceMonitorEnabled=true >/dev/null
+	@echo "Rendering addon-agent metrics templates (Hosted mode)..."
+	@set -e; for enable_service_proxy in false true; do \
+		echo "==> enableServiceProxy=$${enable_service_proxy}"; \
+		helm template smoke $(ADDON_AGENT_CHART) \
+			--show-only templates/agent-metrics.yaml \
+			--set image=cluster-proxy --set tag=test \
+			--set installMode=Hosted \
+			--set enableServiceProxy="$${enable_service_proxy}" \
+			--set enableKubeApiProxy=true \
+			--set agentMetricsServiceEnabled=true \
+			--set agentServiceMonitorEnabled=true >/dev/null; \
+	done
+	@echo "Rendering full hosted addon-agent chart..."
+	@set -e; rendered="$$(mktemp)"; \
+	helm template smoke $(ADDON_AGENT_CHART) \
+		--set image=cluster-proxy --set tag=test \
+		--set installMode=Hosted \
+		--set enableServiceProxy=true \
+		--set enableKubeApiProxy=true >"$${rendered}"; \
+	grep -q "name: cluster-proxy-proxy-agent" "$${rendered}"; \
+	grep -q "addon.open-cluster-management.io/hosted-manifest-location: hosting" "$${rendered}"; \
+	grep -q "name: cluster-proxy-service-relay" "$${rendered}"
+
 .PHONY: envtest-setup
 envtest-setup:
 	$(eval export KUBEBUILDER_ASSETS=$(shell curl -fsSL $(ENSURE_ENVTEST_SCRIPT) | bash))
@@ -122,19 +186,27 @@ client-gen:
  	-g lister-gen \
  	--versions=open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1
 
+# cmd/Dockerfile uses BuildKit-only features (FROM --platform=$BUILDPLATFORM and the
+# auto-populated TARGETOS/TARGETARCH ARGs), so the build must run under BuildKit/buildx.
+# DOCKER_BUILDKIT=1 enables BuildKit when CONTAINER_ENGINE=docker; podman builds
+# honor the same syntax natively.
 images:
-	$(CONTAINER_ENGINE) build \
+	DOCKER_BUILDKIT=1 $(CONTAINER_ENGINE) build \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
+.PHONY: images
 
 images-amd64:
 	$(CONTAINER_ENGINE) buildx build \
 		--platform linux/amd64 \
 		--load \
+		$(IMAGE_BUILD_EXTRA_FLAGS) \
 		-f cmd/Dockerfile \
 		--build-arg ADDON_AGENT_IMAGE_NAME=$(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) \
 		-t $(IMAGE_REGISTRY_NAME)/$(IMAGE_NAME):$(IMAGE_TAG) .
+.PHONY: images-amd64
 
 ## Integration Testing
 
@@ -220,6 +292,98 @@ test-e2e: delete-e2e-image-from-kind build-e2e-image load-e2e-image-kind
 	     test/e2e/env/job.yaml | kubectl apply -f -
 	@./test/e2e/env/wait-for-job.sh cluster-proxy-e2e open-cluster-management-addon 1200
 .PHONY: test-e2e
+
+setup-env-for-e2e-hosted: images
+	@echo "Setting up environment for hosted e2e tests..."
+	CONTAINER_ENGINE=$(CONTAINER_ENGINE) \
+	IMAGE_REGISTRY_NAME=$(IMAGE_REGISTRY_NAME) \
+	IMAGE_NAME=$(IMAGE_NAME) \
+	IMAGE_TAG=$(IMAGE_TAG) \
+	HUB_CLUSTER_NAME=$(E2E_HOSTED_HUB_CLUSTER_NAME) \
+	HOSTING_CLUSTER_NAME=$(E2E_HOSTED_HOSTING_CLUSTER_NAME) \
+	MANAGED_CLUSTER_NAME=$(E2E_HOSTED_MANAGED_CLUSTER_NAME) \
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	./test/e2e/env/init-hosted.sh
+.PHONY: setup-env-for-e2e-hosted
+
+clean-e2e-hosted:
+	@echo "Cleaning up hosted e2e kind clusters..."
+	-kind delete cluster --name $(E2E_HOSTED_HUB_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_HOSTING_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_MANAGED_CLUSTER_NAME)
+	@workdir='$(E2E_HOSTED_WORK_DIR)'; \
+	if [ -z "$$workdir" ]; then \
+		echo "ERROR: E2E_HOSTED_WORK_DIR is empty; refusing rm -rf" >&2; \
+		exit 1; \
+	fi; \
+	case "$$workdir" in \
+		/|//|/.|/..|.|..) \
+			echo "ERROR: E2E_HOSTED_WORK_DIR='$$workdir' resolves to root or current/parent dir; refusing rm -rf" >&2; \
+			exit 1 ;; \
+		*[[:space:]]*) \
+			echo "ERROR: E2E_HOSTED_WORK_DIR='$$workdir' contains whitespace; refusing rm -rf to avoid unsafe word-splitting" >&2; \
+			exit 1 ;; \
+	esac; \
+	rm -rf -- "$$workdir"
+.PHONY: clean-e2e-hosted
+
+test-e2e-hosted: clean-e2e-hosted setup-env-for-e2e-hosted
+	@echo "Running hosted e2e tests..."
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	PROXY_ENTRYPOINT_LOCAL_PORT=$(E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT) \
+	USER_SERVER_LOCAL_PORT=$(E2E_HOSTED_USER_SERVER_LOCAL_PORT) \
+	./test/e2e/env/run-hosted.sh
+	@echo "Running hosted e2e cleanup tests..."
+	WORK_DIR=$(E2E_HOSTED_WORK_DIR) \
+	PROXY_ENTRYPOINT_LOCAL_PORT=$(E2E_HOSTED_PROXY_ENTRYPOINT_LOCAL_PORT) \
+	USER_SERVER_LOCAL_PORT=$(E2E_HOSTED_USER_SERVER_LOCAL_PORT) \
+	HOSTED_LABEL_FILTER=hosted-cleanup \
+	./test/e2e/env/run-hosted.sh
+.PHONY: test-e2e-hosted
+
+setup-env-for-e2e-hosted-no-worker: images
+	@echo "Setting up environment for hosted no-worker e2e tests..."
+	CONTAINER_ENGINE=$(CONTAINER_ENGINE) \
+	IMAGE_REGISTRY_NAME=$(IMAGE_REGISTRY_NAME) \
+	IMAGE_NAME=$(IMAGE_NAME) \
+	IMAGE_TAG=$(IMAGE_TAG) \
+	HUB_CLUSTER_NAME=$(E2E_HOSTED_NO_WORKER_HUB_CLUSTER_NAME) \
+	HOSTING_CLUSTER_NAME=$(E2E_HOSTED_NO_WORKER_HOSTING_CLUSTER_NAME) \
+	MANAGED_CLUSTER_NAME=$(E2E_HOSTED_NO_WORKER_MANAGED_CLUSTER_NAME) \
+	WORK_DIR=$(E2E_HOSTED_NO_WORKER_WORK_DIR) \
+	MANAGED_CLUSTER_WORKLOADS_UNSCHEDULABLE=true \
+	./test/e2e/env/init-hosted.sh
+.PHONY: setup-env-for-e2e-hosted-no-worker
+
+clean-e2e-hosted-no-worker:
+	@echo "Cleaning up hosted no-worker e2e kind clusters..."
+	-kind delete cluster --name $(E2E_HOSTED_NO_WORKER_HUB_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_NO_WORKER_HOSTING_CLUSTER_NAME)
+	-kind delete cluster --name $(E2E_HOSTED_NO_WORKER_MANAGED_CLUSTER_NAME)
+	@workdir='$(E2E_HOSTED_NO_WORKER_WORK_DIR)'; \
+	if [ -z "$$workdir" ]; then \
+		echo "ERROR: E2E_HOSTED_NO_WORKER_WORK_DIR is empty; refusing rm -rf" >&2; \
+		exit 1; \
+	fi; \
+	case "$$workdir" in \
+		/|//|/.|/..|.|..) \
+			echo "ERROR: E2E_HOSTED_NO_WORKER_WORK_DIR='$$workdir' resolves to root or current/parent dir; refusing rm -rf" >&2; \
+			exit 1 ;; \
+		*[[:space:]]*) \
+			echo "ERROR: E2E_HOSTED_NO_WORKER_WORK_DIR='$$workdir' contains whitespace; refusing rm -rf to avoid unsafe word-splitting" >&2; \
+			exit 1 ;; \
+	esac; \
+	rm -rf -- "$$workdir"
+.PHONY: clean-e2e-hosted-no-worker
+
+test-e2e-hosted-no-worker: clean-e2e-hosted-no-worker setup-env-for-e2e-hosted-no-worker
+	@echo "Running hosted no-worker e2e tests..."
+	WORK_DIR=$(E2E_HOSTED_NO_WORKER_WORK_DIR) \
+	PROXY_ENTRYPOINT_LOCAL_PORT=$(E2E_HOSTED_NO_WORKER_PROXY_ENTRYPOINT_LOCAL_PORT) \
+	USER_SERVER_LOCAL_PORT=$(E2E_HOSTED_NO_WORKER_USER_SERVER_LOCAL_PORT) \
+	HOSTED_LABEL_FILTER=hosted-no-worker \
+	./test/e2e/env/run-hosted.sh
+.PHONY: test-e2e-hosted-no-worker
 
 # Rapid iteration workflow for e2e tests (cleans up everything first)
 # Use LABEL_FILTER to run specific tests, e.g.: make retest-e2e LABEL_FILTER="connectivity"

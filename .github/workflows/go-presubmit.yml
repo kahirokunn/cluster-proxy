@@ -76,6 +76,17 @@ jobs:
       - name: integration
         run: make test-integration
 
+  helm-templates:
+    name: helm-templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: Install helm
+        uses: azure/setup-helm@v4
+      - name: Lint and render Helm charts
+        run: make verify-helm-templates
+
   e2e:
     name: e2e
     runs-on: ubuntu-latest
@@ -98,3 +109,42 @@ jobs:
         run: make setup-env-for-e2e && make deploy-cluster-proxy-e2e
       - name: Run e2e tests
         run: make test-e2e
+
+  e2e-hosted:
+    name: e2e-hosted
+    runs-on: ubuntu-latest
+    env:
+      CLUSTERADM_VERSION: v1.3.1
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: install Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install kind
+        uses: helm/kind-action@v1.10.0
+        with:
+          install_only: true
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+      - name: Install helm
+        uses: azure/setup-helm@v4
+      - name: Install clusteradm
+        run: |
+          curl -L "https://raw.githubusercontent.com/open-cluster-management-io/clusteradm/${CLUSTERADM_VERSION}/install.sh" \
+            | bash -s -- "${CLUSTERADM_VERSION}"
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+      - name: Run hosted e2e tests
+        run: make test-e2e-hosted
+      - name: Clean hosted e2e clusters
+        if: always()
+        run: make clean-e2e-hosted
+      - name: Run hosted no-worker e2e tests
+        run: make test-e2e-hosted-no-worker

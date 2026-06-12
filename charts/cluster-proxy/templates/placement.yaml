@@ -1,4 +1,4 @@
-{{- if not .Values.installByPlacement.placementName }}
+{{- if and .Values.installByPlacement.enabled (not .Values.installByPlacement.placementName) }}
 apiVersion: cluster.open-cluster-management.io/v1beta1
 kind: Placement
 metadata:

@@ -285,3 +285,25 @@ func TestGetTargetServiceURLFromRequest(t *testing.T) {
 		}
 	}
 }
+
+func TestBearerTokenFromHeader(t *testing.T) {
+	testcases := []struct {
+		header string
+		want   string
+	}{
+		{header: "", want: ""},
+		{header: "Bearer", want: ""},
+		{header: "Bearer ", want: ""},
+		{header: "Bearer abc", want: "abc"},
+		{header: "bearer abc", want: "abc"},
+		{header: "BEARER abc", want: "abc"},
+		{header: "Bearer   xyz  ", want: "xyz"},
+		{header: "Basic abc", want: ""},
+		{header: "Bearertoken", want: ""},
+	}
+	for _, tc := range testcases {
+		if got := BearerTokenFromHeader(tc.header); got != tc.want {
+			t.Errorf("BearerTokenFromHeader(%q) = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+}

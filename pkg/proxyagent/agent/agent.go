@@ -16,8 +16,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -30,6 +33,7 @@ import (
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
 	"open-cluster-management.io/cluster-proxy/pkg/common"
 	"open-cluster-management.io/cluster-proxy/pkg/config"
+	"open-cluster-management.io/cluster-proxy/pkg/constant"
 	"open-cluster-management.io/cluster-proxy/pkg/proxyserver/operator/authentication/selfsigned"
 	"open-cluster-management.io/cluster-proxy/pkg/util"
 )
@@ -46,7 +50,15 @@ const (
 	// See more details: https://coredns.io/manual/setups/#recursive-resolver; https://github.com/golang/go/blob/6f445a9db55f65e55c5be29d3c506ecf3be37915/src/net/dnsclient_unix.go#L666
 	// The default value is "svc.cluster.local". We can also set a CustomizedVariables with key "serviceDomain" to overwrite it.
 	serviceDomain = "svc.cluster.local"
+
+	agentServiceMonitorLabelsVariable = "agentServiceMonitorLabels"
 )
+
+var serviceMonitorGVK = schema.GroupVersionKind{
+	Group:   "monitoring.coreos.com",
+	Version: "v1",
+	Kind:    "ServiceMonitor",
+}
 
 func NewAgentAddon(
 	signer selfsigned.SelfSigner,
@@ -88,6 +100,8 @@ func NewAgentAddon(
 	})
 
 	agentFactory := addonfactory.NewAgentAddonFactory(common.AddonName, FS, "manifests/charts/addon-agent").
+		WithScheme(newAgentScheme()).
+		WithAgentHostedModeEnabledOption().
 		WithAgentRegistrationOption(&agent.RegistrationOption{
 			CSRConfigurations: func(cluster *clusterv1.ManagedCluster, addon *addonv1alpha1.ManagedClusterAddOn) ([]addonv1alpha1.RegistrationConfig, error) {
 				return regConfigs, nil
@@ -105,6 +119,16 @@ func NewAgentAddon(
 							APIGroups: []string{"coordination.k8s.io"},
 							Verbs:     []string{"*"},
 							Resources: []string{"leases"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"get"},
+							Resources: []string{"managedclusteraddons"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"update"},
+							Resources: []string{"managedclusteraddons/status"},
 						},
 					},
 				}).
@@ -145,6 +169,12 @@ func NewAgentAddon(
 		WithAgentInstallNamespace(agentInstallNamespaceFunc(utils.NewAddOnDeploymentConfigGetter(addonClient)))
 
 	return agentFactory.BuildHelmAgentAddon()
+}
+
+func newAgentScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	s.AddKnownTypeWithName(serviceMonitorGVK, &unstructured.Unstructured{})
+	return s
 }
 
 // agentInstallNamespaceFunc returns namespace from AddonDeploymentConfig, and config.DefaultAddonInstallNamespace if
@@ -332,8 +362,22 @@ func removeDupAndSortServices(services []serviceToExpose) []serviceToExpose {
 func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 	return func(config addonv1alpha1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 		values := addonfactory.Values{}
+		agentServiceMonitorLabels := ""
 		for _, variable := range config.Spec.CustomizedVariables {
 			values[variable.Name] = variable.Value
+			if variable.Name == agentServiceMonitorLabelsVariable {
+				agentServiceMonitorLabels = variable.Value
+			}
+		}
+
+		labels, err := parseAgentServiceMonitorLabels(agentServiceMonitorLabels)
+		if err != nil {
+			return nil, err
+		}
+		values[agentServiceMonitorLabelsVariable] = labels
+
+		if err := validateServiceRelayOverrides(values); err != nil {
+			return nil, err
 		}
 
 		if config.Spec.NodePlacement != nil {
@@ -358,4 +402,54 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1alpha1.AddOnD
 		}
 		return values, nil
 	}
+}
+
+// validateServiceRelayOverrides rejects malformed serviceRelayName/serviceRelayPort
+// overrides. The health/metrics listener port is reserved for the service-relay.
+func validateServiceRelayOverrides(values addonfactory.Values) error {
+	if name, ok := values["serviceRelayName"].(string); ok {
+		if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+			return fmt.Errorf("invalid serviceRelayName %q: %s", name, strings.Join(errs, "; "))
+		}
+	}
+	if portStr, ok := values["serviceRelayPort"].(string); ok {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid serviceRelayPort %q: must be an integer between 1 and 65535", portStr)
+		}
+		if port == constant.ServiceRelayHealthProbePort {
+			return fmt.Errorf("invalid serviceRelayPort %q: %d is reserved for the relay health/metrics listener", portStr, constant.ServiceRelayHealthProbePort)
+		}
+	}
+	return nil
+}
+
+func parseAgentServiceMonitorLabels(rawLabels string) (map[string]string, error) {
+	labels := map[string]string{}
+	rawLabels = strings.TrimSpace(rawLabels)
+	if rawLabels == "" {
+		return labels, nil
+	}
+
+	for _, rawPair := range strings.Split(rawLabels, ",") {
+		rawKey, rawValue, ok := strings.Cut(rawPair, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s must be a comma-separated list of key=value pairs; got %q",
+				agentServiceMonitorLabelsVariable, rawPair)
+		}
+
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(rawValue)
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("%s contains invalid label key %q: %s",
+				agentServiceMonitorLabelsVariable, key, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			return nil, fmt.Errorf("%s contains invalid label value for key %q: %s",
+				agentServiceMonitorLabelsVariable, key, strings.Join(errs, "; "))
+		}
+		labels[key] = value
+	}
+
+	return labels, nil
 }

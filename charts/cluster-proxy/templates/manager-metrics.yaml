@@ -1,0 +1,40 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-addon-manager-metrics
+  labels:
+    open-cluster-management.io/addon: cluster-proxy
+    component: cluster-proxy-manager
+spec:
+  type: ClusterIP
+  selector:
+    open-cluster-management.io/addon: cluster-proxy
+    component: cluster-proxy-manager
+  ports:
+    - name: metrics
+      port: {{ include "cluster-proxy.metricsPort" . }}
+      targetPort: metrics
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-addon-manager-metrics
+{{- with .Values.metrics.serviceMonitor.labels }}
+  labels:
+{{- toYaml . | nindent 4 }}
+{{- end }}
+spec:
+  selector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      component: cluster-proxy-manager
+  endpoints:
+    - path: /metrics
+      scheme: http
+      port: metrics
+{{- end }}
+{{- end }}

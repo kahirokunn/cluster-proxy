@@ -1,0 +1,222 @@
+{{- if and .Values.enableServiceProxy (eq .Values.installMode "Hosted") }}
+{{- $enableAgentMetricsService := or (eq (toString .Values.agentMetricsServiceEnabled) "true") (eq (toString .Values.agentServiceMonitorEnabled) "true") -}}
+{{- $enableAgentServiceMonitor := eq (toString .Values.agentServiceMonitorEnabled) "true" -}}
+# The relay is the managed-cluster receiver for hosted service-proxy traffic.
+# Its primary trust boundary is enforced in the relay binary via TokenReview
+# against the managed kube-apiserver (see --trusted-caller-username), so a
+# managed-cluster Pod that reaches this Service's ClusterIP directly cannot
+# use it as an open HTTP proxy. The chart intentionally does not ship a
+# NetworkPolicy because the allowed ingress source depends on how the managed
+# cluster runs its kube-apiserver (host-network on control plane nodes vs.
+# a labeled Pod in kube-system) and on the cluster's CNI. Operators are
+# expected to apply a NetworkPolicy that restricts ingress to the relay Pod
+# to traffic from the managed kube-apiserver as a belt-and-braces defense;
+# see the "Recommended NetworkPolicy for the managed service-relay" section
+# in the top-level README for a concrete example.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay-proxy
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - services/proxy
+    resourceNames:
+      - {{ .Values.serviceRelayName }}
+      - http:{{ .Values.serviceRelayName }}
+      - http:{{ .Values.serviceRelayName }}:{{ .Values.serviceRelayPort }}
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cluster-proxy-service-relay-proxy
+subjects:
+  - kind: ServiceAccount
+    name: cluster-proxy
+    namespace: {{ .Release.Namespace }}
+---
+# Dedicated least-privilege ServiceAccount for the relay Pod. The relay
+# authenticates every inbound caller by submitting its bearer token to the
+# managed kube-apiserver's TokenReview API (see the trust-boundary comment
+# above), so `tokenreviews: create` is the only managed-cluster permission the
+# relay Pod itself requires. Running the relay under the shared cluster-proxy
+# ServiceAccount would let it inherit that account's
+# cluster-proxy-addon-agent-impersonator ClusterRole (impersonate users/groups),
+# so a compromised relay Pod could impersonate arbitrary managed-cluster
+# identities. The dedicated account below carries no impersonation rights.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-proxy-service-relay
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  {{- if eq .Release.Namespace "open-cluster-management-agent-addon" }}
+  name: cluster-proxy-service-relay
+  {{- else }}
+  name: cluster-proxy-service-relay:{{ .Release.Namespace }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-proxy-service-relay
+subjects:
+  - kind: ServiceAccount
+    name: cluster-proxy-service-relay
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: {{ .Values.serviceRelayName }}
+spec:
+  type: ClusterIP
+  selector:
+    open-cluster-management.io/addon: cluster-proxy
+    proxy.open-cluster-management.io/component-name: service-relay
+  ports:
+    - name: http
+      port: {{ .Values.serviceRelayPort }}
+      targetPort: {{ .Values.serviceRelayPort }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: {{ .Values.serviceRelayName }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      proxy.open-cluster-management.io/component-name: service-relay
+  template:
+    metadata:
+      labels:
+        open-cluster-management.io/addon: cluster-proxy
+        proxy.open-cluster-management.io/component-name: service-relay
+    spec:
+      serviceAccountName: cluster-proxy-service-relay
+      {{- if .Values.tolerations }}
+      tolerations: {{ toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nodeSelector }}
+      nodeSelector: {{ toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: service-relay
+          image: {{ .Values.registry }}/{{ .Values.image }}:{{ .Values.tag }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /cluster-proxy
+          args:
+            - service-relay
+            - --listen=:{{ .Values.serviceRelayPort }}
+            - --health-probe-bind-address=:8000
+            - --trusted-caller-username=system:serviceaccount:{{ .Release.Namespace }}:cluster-proxy
+          {{- if .Values.additionalServiceCAConfigMap }}
+            - --additional-service-ca=/additional-service-ca/service-ca.crt
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.serviceRelayPort }}
+            - name: metrics
+              containerPort: 8000
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+          {{- if .Values.additionalServiceCAConfigMap }}
+          volumeMounts:
+            - name: additional-service-ca
+              mountPath: /additional-service-ca
+              readOnly: true
+          {{- end }}
+      {{- if .Values.additionalServiceCAConfigMap }}
+      volumes:
+        - name: additional-service-ca
+          configMap:
+            name: {{ .Values.additionalServiceCAConfigMap }}
+            optional: true
+      {{- end }}
+      imagePullSecrets:
+      {{- range .Values.proxyAgentImagePullSecrets }}
+        - name: {{ . }}
+      {{- end }}
+{{- if $enableAgentMetricsService }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay-metrics
+  labels:
+    open-cluster-management.io/addon: cluster-proxy
+    proxy.open-cluster-management.io/component-name: service-relay
+spec:
+  type: ClusterIP
+  selector:
+    open-cluster-management.io/addon: cluster-proxy
+    proxy.open-cluster-management.io/component-name: service-relay
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+{{- if $enableAgentServiceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-service-relay-metrics
+{{- with .Values.agentServiceMonitorLabels }}
+  labels:
+{{- toYaml . | nindent 4 }}
+{{- end }}
+spec:
+  selector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      proxy.open-cluster-management.io/component-name: service-relay
+  endpoints:
+    - path: /metrics
+      scheme: http
+      port: metrics
+{{- end }}
+{{- end }}
+{{- end }}
