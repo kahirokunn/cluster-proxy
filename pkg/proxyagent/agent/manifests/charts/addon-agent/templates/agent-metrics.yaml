@@ -1,0 +1,71 @@
+{{- $enableServiceProxy := .Values.enableServiceProxy -}}
+{{- $enableAgentMetricsService := or (eq (toString .Values.agentMetricsServiceEnabled) "true") (eq (toString .Values.agentServiceMonitorEnabled) "true") -}}
+{{- $enableAgentServiceMonitor := eq (toString .Values.agentServiceMonitorEnabled) "true" -}}
+{{- if $enableAgentMetricsService }}
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-agent-metrics
+  labels:
+    open-cluster-management.io/addon: cluster-proxy
+    proxy.open-cluster-management.io/component-name: proxy-agent
+{{- if eq .Values.installMode "Hosted" }}
+  annotations:
+    addon.open-cluster-management.io/hosted-manifest-location: hosting
+{{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    open-cluster-management.io/addon: cluster-proxy
+    proxy.open-cluster-management.io/component-name: proxy-agent
+  ports:
+    - name: agent-metrics
+      port: 8888
+      targetPort: agent-metrics
+{{- if $enableServiceProxy }}
+    - name: svc-metrics
+      port: 8000
+      targetPort: svc-metrics
+{{- end }}
+{{- if and .Values.enableKubeApiProxy (eq .Values.installMode "Hosted") }}
+    - name: api-metrics
+      port: 8001
+      targetPort: api-metrics
+{{- end }}
+{{- if $enableAgentServiceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: cluster-proxy-agent-metrics
+{{- with .Values.agentServiceMonitorLabels }}
+  labels:
+{{- toYaml . | nindent 4 }}
+{{- end }}
+{{- if eq .Values.installMode "Hosted" }}
+  annotations:
+    addon.open-cluster-management.io/hosted-manifest-location: hosting
+{{- end }}
+spec:
+  selector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      proxy.open-cluster-management.io/component-name: proxy-agent
+  endpoints:
+    - path: /metrics
+      scheme: http
+      port: agent-metrics
+{{- if $enableServiceProxy }}
+    - path: /metrics
+      scheme: http
+      port: svc-metrics
+{{- end }}
+{{- if and .Values.enableKubeApiProxy (eq .Values.installMode "Hosted") }}
+    - path: /metrics
+      scheme: http
+      port: api-metrics
+{{- end }}
+{{- end }}
+{{- end }}

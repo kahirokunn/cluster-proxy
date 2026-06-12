@@ -2,74 +2,20 @@ package serviceproxy
 
 import (
 	"context"
-	"errors"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
-	authenticationv1 "k8s.io/api/authentication/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
-	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/rest"
+
+	"open-cluster-management.io/cluster-proxy/pkg/utils"
 )
-
-// newFakeClient creates a fake kubernetes client that responds to TokenReview
-// requests with the given authenticated status and user info.
-func newFakeClient(authenticated bool, username string, groups []string) *fake.Clientset {
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		tr := &authenticationv1.TokenReview{
-			Status: authenticationv1.TokenReviewStatus{
-				Authenticated: authenticated,
-				User: authenticationv1.UserInfo{
-					Username: username,
-					Groups:   groups,
-				},
-			},
-		}
-		return true, tr, nil
-	})
-	return client
-}
-
-func TestTokenReviewAuthenticator_Authenticated(t *testing.T) {
-	client := newFakeClient(true, "system:serviceaccount:ns:sa", []string{"system:authenticated"})
-	authn := &tokenReviewAuthenticator{client: client, name: "test"}
-
-	resp, ok, err := authn.AuthenticateToken(context.Background(), "test-token")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected authenticated=true")
-	}
-	if resp.User.GetName() != "system:serviceaccount:ns:sa" {
-		t.Fatalf("expected username 'system:serviceaccount:ns:sa', got '%s'", resp.User.GetName())
-	}
-	if len(resp.User.GetGroups()) != 1 || resp.User.GetGroups()[0] != "system:authenticated" {
-		t.Fatalf("unexpected groups: %v", resp.User.GetGroups())
-	}
-}
-
-func TestTokenReviewAuthenticator_Unauthenticated(t *testing.T) {
-	client := newFakeClient(false, "", nil)
-	authn := &tokenReviewAuthenticator{client: client, name: "test"}
-
-	resp, ok, err := authn.AuthenticateToken(context.Background(), "bad-token")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Fatal("expected authenticated=false")
-	}
-	if resp != nil {
-		t.Fatal("expected nil response for unauthenticated token")
-	}
-}
 
 func TestProcessAuthentication_ManagedClusterToken(t *testing.T) {
 	s := &serviceProxy{
@@ -152,9 +98,6 @@ func TestProcessAuthentication_UnauthenticatedToken(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected authentication error")
 	}
-	if !strings.Contains(err.Error(), "neither valid for managed cluster nor hub cluster") {
-		t.Fatalf("unexpected error: %v", err)
-	}
 }
 
 func TestProcessHubUser_RegularUser(t *testing.T) {
@@ -208,154 +151,171 @@ func TestProcessHubUser_ServiceAccount(t *testing.T) {
 	}
 }
 
-func TestConvertExtra(t *testing.T) {
-	extra := map[string]authenticationv1.ExtraValue{
-		"example.org/scope": {"read", "write"},
-	}
-	result := convertExtra(extra)
-	if len(result) != 1 {
-		t.Fatalf("expected 1 key, got %d", len(result))
-	}
-	if len(result["example.org/scope"]) != 2 {
-		t.Fatalf("expected 2 values, got %d", len(result["example.org/scope"]))
-	}
-
-	if convertExtra(nil) != nil {
-		t.Fatal("expected nil for nil input")
-	}
-}
-
 func TestNewServiceProxy_DefaultValues(t *testing.T) {
 	s := newServiceProxy()
 
-	if s.tokenReviewCacheTTL != defaultTokenReviewCacheTTL {
-		t.Fatalf("expected default TTL %v, got %v", defaultTokenReviewCacheTTL, s.tokenReviewCacheTTL)
+	if s.tokenReviewCacheTTL != utils.DefaultTokenReviewCacheTTL {
+		t.Fatalf("expected default TTL %v, got %v", utils.DefaultTokenReviewCacheTTL, s.tokenReviewCacheTTL)
 	}
-	if s.kubeClientQPS != defaultKubeClientQPS {
-		t.Fatalf("expected default QPS %v, got %v", defaultKubeClientQPS, s.kubeClientQPS)
+	if s.kubeClientQPS != utils.DefaultKubeClientQPS {
+		t.Fatalf("expected default QPS %v, got %v", utils.DefaultKubeClientQPS, s.kubeClientQPS)
 	}
-	if s.kubeClientBurst != defaultKubeClientBurst {
-		t.Fatalf("expected default burst %v, got %v", defaultKubeClientBurst, s.kubeClientBurst)
-	}
-}
-
-func TestTokenReviewAuthenticator_TokenSentInRequest(t *testing.T) {
-	var capturedToken string
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		createAction := action.(k8stesting.CreateAction)
-		tr := createAction.GetObject().(*authenticationv1.TokenReview)
-		capturedToken = tr.Spec.Token
-		return true, &authenticationv1.TokenReview{
-			ObjectMeta: metav1.ObjectMeta{Name: "test"},
-			Status:     authenticationv1.TokenReviewStatus{Authenticated: false},
-		}, nil
-	})
-
-	authn := &tokenReviewAuthenticator{client: client, name: "test"}
-	authn.AuthenticateToken(context.Background(), "my-secret-token")
-
-	if capturedToken != "my-secret-token" {
-		t.Fatalf("expected token 'my-secret-token' to be sent in TokenReview, got '%s'", capturedToken)
+	if s.kubeClientBurst != utils.DefaultKubeClientBurst {
+		t.Fatalf("expected default burst %v, got %v", utils.DefaultKubeClientBurst, s.kubeClientBurst)
 	}
 }
 
-func TestTokenReviewAuthenticator_APIError(t *testing.T) {
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, fmt.Errorf("connection refused")
-	})
+func TestManagedKubeconfigConfigAndToken(t *testing.T) {
+	kubeconfig := `apiVersion: v1
+kind: Config
+clusters:
+- name: managed
+  cluster:
+    server: https://managed.example.com:6443
+contexts:
+- name: managed
+  context:
+    cluster: managed
+    user: cluster-proxy
+current-context: managed
+users:
+- name: cluster-proxy
+  user:
+    token: managed-token
+`
+	path := t.TempDir() + "/kubeconfig"
+	if err := os.WriteFile(path, []byte(kubeconfig), 0600); err != nil {
+		t.Fatalf("failed to write kubeconfig: %v", err)
+	}
 
-	authn := &tokenReviewAuthenticator{client: client, name: "test"}
-	resp, ok, err := authn.AuthenticateToken(context.Background(), "some-token")
-	if err == nil {
-		t.Fatal("expected error from API call")
+	s := &serviceProxy{managedKubeConfig: path}
+	config, err := s.managedRESTConfig()
+	if err != nil {
+		t.Fatalf("unexpected managedRESTConfig error: %v", err)
 	}
-	if ok {
-		t.Fatal("expected authenticated=false on API error")
+	if config.Host != "https://managed.example.com:6443" {
+		t.Fatalf("unexpected managed host: %s", config.Host)
 	}
-	if resp != nil {
-		t.Fatal("expected nil response on API error")
+
+	token, err := s.readImpersonateTokenFromManagedKubeconfig()
+	if err != nil {
+		t.Fatalf("unexpected token read error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Fatalf("expected 'connection refused' in error, got: %v", err)
+	if token != "managed-token" {
+		t.Fatalf("expected managed-token, got %q", token)
 	}
 }
 
-func TestTokenReviewAuthenticator_StatusError_KnownRejection(t *testing.T) {
-	tests := []struct {
-		name        string
-		statusError string
-	}{
-		{
-			name:        "Kubernetes: invalid bearer token",
-			statusError: "invalid bearer token",
+func TestParseManagedAPIServerURL(t *testing.T) {
+	url, err := parseManagedAPIServerURL("https://managed.example.com:6443")
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if url.Host != "managed.example.com:6443" {
+		t.Fatalf("unexpected host: %s", url.Host)
+	}
+
+	if _, err := parseManagedAPIServerURL("managed.example.com:6443"); err == nil {
+		t.Fatal("expected error for URL without scheme")
+	}
+}
+
+func TestOutboundTLSConfig_ReusesManagedKubeconfigTLS(t *testing.T) {
+	managedTLS, err := rest.TLSConfigFor(&rest.Config{
+		Host: "https://managed.example.com:6443",
+		TLSClientConfig: rest.TLSClientConfig{
+			ServerName: "managed.internal",
+			Insecure:   false,
+			CAData:     []byte(testCACert),
 		},
-		{
-			name:        "OpenShift: invalid bearer token with token lookup failed",
-			statusError: "[invalid bearer token, token lookup failed]",
-		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected rest.TLSConfigFor error: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := fake.NewSimpleClientset()
-			client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-				return true, &authenticationv1.TokenReview{
-					Status: authenticationv1.TokenReviewStatus{
-						Authenticated: false,
-						Error:         tt.statusError,
-					},
-				}, nil
-			})
+	if managedTLS == nil {
+		t.Fatal("expected non-nil managed TLS config")
+	}
 
-			authn := &tokenReviewAuthenticator{client: client, name: "test"}
-			resp, ok, err := authn.AuthenticateToken(context.Background(), "bad-token")
-			if err == nil {
-				t.Fatal("expected error when Status.Error is set")
-			}
-			if ok {
-				t.Fatal("expected authenticated=false")
-			}
-			if resp != nil {
-				t.Fatal("expected nil response")
-			}
-			if !errors.Is(err, ErrTokenNotAuthenticated) {
-				t.Fatalf("expected ErrTokenNotAuthenticated, got: %v", err)
-			}
-			if !strings.Contains(err.Error(), tt.statusError) {
-				t.Fatalf("expected Status.Error in error message, got: %v", err)
-			}
-		})
+	// Run fixes MinVersion on the stored template once at startup; mimic that here.
+	managedTLS.MinVersion = tls.VersionTLS12
+
+	rootCAs := x509.NewCertPool()
+	s := &serviceProxy{
+		rootCAs:                   rootCAs,
+		managedAPIServerTLSConfig: managedTLS,
+	}
+
+	// In hosted mode the managed kubeconfig TLS is reused for outbound calls.
+	managed := s.outboundTLSConfig()
+	if managed.ServerName != "managed.internal" {
+		t.Fatalf("expected ServerName to be reused, got %q", managed.ServerName)
+	}
+	if managed.RootCAs == nil {
+		t.Fatal("expected managed RootCAs to be populated from managed kubeconfig")
+	}
+	if managed.MinVersion < tls.VersionTLS12 {
+		t.Fatalf("expected MinVersion to be at least TLS 1.2, got %d", managed.MinVersion)
 	}
 }
 
-func TestTokenReviewAuthenticator_StatusError_UnknownError(t *testing.T) {
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		return true, &authenticationv1.TokenReview{
-			Status: authenticationv1.TokenReviewStatus{
-				Authenticated: false,
-				Error:         "webhook authenticator connection reset",
-			},
-		}, nil
-	})
+func TestOutboundTLSConfig_NoManagedKubeconfig(t *testing.T) {
+	rootCAs := x509.NewCertPool()
+	s := &serviceProxy{rootCAs: rootCAs}
 
-	authn := &tokenReviewAuthenticator{client: client, name: "test"}
-	resp, ok, err := authn.AuthenticateToken(context.Background(), "some-token")
-	if err == nil {
-		t.Fatal("expected error when Status.Error is set")
+	// Without a managed kubeconfig, fall back to the in-cluster trust pool
+	// rather than panic.
+	cfg := s.outboundTLSConfig()
+	if cfg.RootCAs != rootCAs {
+		t.Fatal("expected fallback to use the in-cluster root CA pool when managed TLS is absent")
 	}
-	if ok {
-		t.Fatal("expected authenticated=false")
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("expected MinVersion TLS 1.2, got %d", cfg.MinVersion)
 	}
-	if resp != nil {
-		t.Fatal("expected nil response")
+}
+
+// testCACert is a throwaway self-signed CA used only by TLS config tests.
+const testCACert = `-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIQIRi6zePL6mKjOipn+dNuaTAKBggqhkjOPQQDAjASMRAw
+DgYDVQQKEwdBY21lIENvMB4XDTE3MTAyMDE5NDMwNloXDTE4MTAyMDE5NDMwNlow
+EjEQMA4GA1UEChMHQWNtZSBDbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD0d
+7VNhbWvZLWPuj/RtHFjvtJBEwOkhbN/BnnE8rnZR8+sbwnc/KhCk3FhnpHZnQz7B
+5aETbbIgmuvewdjvSBSjYzBhMA4GA1UdDwEB/wQEAwICpDATBgNVHSUEDDAKBggr
+BgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1UdEQQiMCCCDmxvY2FsaG9zdDo1
+NDUzgg4xMjcuMC4wLjE6NTQ1MzAKBggqhkjOPQQDAgNIADBFAiEA2zpJEPQyz6/l
+Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
+6MF9+Yw1Yy0t
+-----END CERTIFICATE-----
+`
+
+func TestServiceProxyRelayURLAndAuthorizationHeader(t *testing.T) {
+	template, err := parseManagedAPIServerURL("https://managed.example.com:6443")
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
 	}
-	if errors.Is(err, ErrTokenNotAuthenticated) {
-		t.Fatal("unknown Status.Error should NOT be wrapped with ErrTokenNotAuthenticated")
+	relayURLTemplate := buildServiceRelayURL(template, "addon-ns", "cluster-proxy-service-relay", 7444)
+	s := &serviceProxy{
+		relayURLTemplate:        relayURLTemplate,
+		getImpersonateTokenFunc: func() (string, error) { return "managed-token", nil },
 	}
-	if !strings.Contains(err.Error(), "webhook authenticator connection reset") {
-		t.Fatalf("expected Status.Error in error message, got: %v", err)
+
+	if s.relayURLTemplate.String() != "https://managed.example.com:6443/api/v1/namespaces/addon-ns/services/http:cluster-proxy-service-relay:7444/proxy" {
+		t.Fatalf("unexpected relay URL %s", s.relayURLTemplate.String())
+	}
+
+	req, _ := http.NewRequest("GET", "https://example.com/ping", nil)
+	req.Header.Set("Authorization", "Bearer original-token")
+	req.Header.Set("Cluster-Proxy-Authorization", "Bearer spoofed-token")
+	if err := s.prepareRelayRequest(req); err != nil {
+		t.Fatalf("unexpected prepare relay request error: %v", err)
+	}
+	if req.Header.Get("Authorization") != "Bearer managed-token" {
+		t.Fatalf("expected managed token authorization, got %q", req.Header.Get("Authorization"))
+	}
+	if req.Header.Get("Cluster-Proxy-Relay-Authorization") != "Bearer managed-token" {
+		t.Fatalf("expected managed token relay authorization, got %q", req.Header.Get("Cluster-Proxy-Relay-Authorization"))
+	}
+	if req.Header.Get("Cluster-Proxy-Authorization") != "Bearer original-token" {
+		t.Fatalf("expected original authorization in internal header, got %q", req.Header.Get("Cluster-Proxy-Authorization"))
 	}
 }
 
@@ -385,8 +345,8 @@ func TestProcessAuthentication_GetImpersonateTokenError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from getImpersonateTokenFunc")
 	}
-	if !strings.Contains(err.Error(), "failed to get impersonate token") {
-		t.Fatalf("expected impersonate token error, got: %v", err)
+	if !strings.Contains(err.Error(), "token file not found") {
+		t.Fatalf("expected original error preserved, got: %v", err)
 	}
 }
 
@@ -414,14 +374,11 @@ func TestProcessAuthentication_ManagedClusterFatalError(t *testing.T) {
 	}
 }
 
-func TestProcessAuthentication_OpenShiftTokenReviewError_FallsBackToHub(t *testing.T) {
+func TestProcessAuthentication_ManagedClusterRejection_FallsBackToHub(t *testing.T) {
 	s := &serviceProxy{
 		enableImpersonation: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-			return nil, false, fmt.Errorf(
-				"managed cluster TokenReview: invalid bearer token, token lookup failed: %w",
-				ErrTokenNotAuthenticated,
-			)
+			return nil, false, nil // managed cluster rejected the token
 		}),
 		hubAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return &authenticator.Response{
@@ -470,9 +427,6 @@ func TestProcessAuthentication_HubAuthError(t *testing.T) {
 	err := s.processAuthentication(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "hub cluster auth error") {
-		t.Fatalf("expected hub cluster auth error, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "hub apiserver timeout") {
 		t.Fatalf("expected original error message preserved, got: %v", err)

@@ -3,10 +3,19 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestGetTargetServiceConfigForKubeAPIServer(t *testing.T) {
 	testcases := []struct {
@@ -281,6 +290,97 @@ func TestGetTargetServiceURLFromRequest(t *testing.T) {
 			}
 			if actual.Path != expectURL.Path {
 				t.Errorf("expected: %v, got: %v", expectURL.Path, actual.Path)
+			}
+		}
+	}
+}
+
+func TestServeReverseProxy(t *testing.T) {
+	target, _ := url.Parse("http://backend.svc")
+
+	t.Run("returns backend status code", func(t *testing.T) {
+		transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusCreated,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		})
+		req := httptest.NewRequest("GET", "http://proxy/ping", nil)
+		recorder := httptest.NewRecorder()
+
+		var logged error
+		status := ServeReverseProxy(recorder, req, target, transport, func(err error) { logged = err })
+
+		if status != http.StatusCreated {
+			t.Fatalf("expected status %d, got %d", http.StatusCreated, status)
+		}
+		if logged != nil {
+			t.Fatalf("expected no logged error, got %v", logged)
+		}
+	})
+
+	t.Run("returns generic bad gateway on transport error", func(t *testing.T) {
+		transportErr := errors.New("dial tcp backend.svc:80: connection refused")
+		transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, transportErr
+		})
+		req := httptest.NewRequest("GET", "http://proxy/ping", nil)
+		recorder := httptest.NewRecorder()
+
+		var logged error
+		status := ServeReverseProxy(recorder, req, target, transport, func(err error) { logged = err })
+
+		if status != http.StatusBadGateway {
+			t.Fatalf("expected status %d, got %d", http.StatusBadGateway, status)
+		}
+		if !errors.Is(logged, transportErr) {
+			t.Fatalf("expected transport error to be logged, got %v", logged)
+		}
+		if body := strings.TrimSpace(recorder.Body.String()); body != "bad gateway" {
+			t.Fatalf("expected generic body %q, got %q", "bad gateway", body)
+		}
+	})
+}
+
+func TestBearerTokenFromHeader(t *testing.T) {
+	testcases := []struct {
+		header string
+		want   string
+	}{
+		{header: "", want: ""},
+		{header: "Bearer", want: ""},
+		{header: "Bearer ", want: ""},
+		{header: "Bearer abc", want: "abc"},
+		{header: "bearer abc", want: "abc"},
+		{header: "BEARER abc", want: "abc"},
+		{header: "Bearer   xyz  ", want: "xyz"},
+		{header: "Basic abc", want: ""},
+		{header: "Bearertoken", want: ""},
+	}
+	for _, tc := range testcases {
+		if got := BearerTokenFromHeader(tc.header); got != tc.want {
+			t.Errorf("BearerTokenFromHeader(%q) = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+}
+
+func TestBearerTokenToHeader(t *testing.T) {
+	testcases := []struct {
+		token string
+		want  string
+	}{
+		{token: "", want: "Bearer "},
+		{token: "abc", want: "Bearer abc"},
+	}
+	for _, tc := range testcases {
+		if got := BearerTokenToHeader(tc.token); got != tc.want {
+			t.Errorf("BearerTokenToHeader(%q) = %q, want %q", tc.token, got, tc.want)
+		}
+		// BearerTokenToHeader is the inverse of BearerTokenFromHeader for non-empty tokens.
+		if tc.token != "" {
+			if got := BearerTokenFromHeader(tc.want); got != tc.token {
+				t.Errorf("BearerTokenFromHeader(%q) = %q, want %q", tc.want, got, tc.token)
 			}
 		}
 	}

@@ -3,16 +3,22 @@ FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 
 WORKDIR /workspace
 
-ARG TARGETOS=linux
+ARG TARGETOS
 ARG TARGETARCH
+ARG OS
+ARG ARCH
 ARG APISERVER_NETWORK_PROXY_VERSION=0.35.0
 ARG KUBECTL_VERSION=v1.30.2
 ARG ADDON_AGENT_IMAGE_NAME
 
-ENV CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH}
+ENV CGO_ENABLED=0
 
 # Build Apiserver-network-proxy binaries
-RUN wget https://github.com/kubernetes-sigs/apiserver-network-proxy/archive/refs/tags/v${APISERVER_NETWORK_PROXY_VERSION}.tar.gz \
+RUN set -eux; \
+      build_os="${OS:-${TARGETOS:-linux}}"; \
+      build_arch="${ARCH:-${TARGETARCH:-$(go env GOHOSTARCH)}}"; \
+      export GOOS="${build_os}" GOARCH="${build_arch}" CGO_ENABLED=0; \
+      wget https://github.com/kubernetes-sigs/apiserver-network-proxy/archive/refs/tags/v${APISERVER_NETWORK_PROXY_VERSION}.tar.gz \
       && tar xzvf v${APISERVER_NETWORK_PROXY_VERSION}.tar.gz \
       && cd apiserver-network-proxy-${APISERVER_NETWORK_PROXY_VERSION} \
       && go build -o /workspace/proxy-server ./cmd/server/ \
@@ -35,11 +41,15 @@ COPY cmd/ cmd/
 COPY pkg pkg/
 
 # Build addons
-RUN go build -a -o agent cmd/addon-agent/main.go
-RUN go build -a \
+RUN set -eux; \
+      build_os="${OS:-${TARGETOS:-linux}}"; \
+      build_arch="${ARCH:-${TARGETARCH:-$(go env GOHOSTARCH)}}"; \
+      export GOOS="${build_os}" GOARCH="${build_arch}" CGO_ENABLED=0; \
+      go build -a -o agent cmd/addon-agent/main.go; \
+      go build -a \
         -ldflags="-X 'open-cluster-management.io/cluster-proxy/pkg/config.AgentImageName=${ADDON_AGENT_IMAGE_NAME}'" \
-        -o manager cmd/addon-manager/main.go
-RUN go build -a -o cluster-proxy cmd/cluster-proxy/main.go
+        -o manager cmd/addon-manager/main.go; \
+      go build -a -o cluster-proxy cmd/cluster-proxy/main.go
 
 # Use Alpine as a minimal base image to package the static binaries.
 FROM alpine:3.21

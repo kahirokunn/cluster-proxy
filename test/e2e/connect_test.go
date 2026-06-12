@@ -47,6 +47,10 @@ const (
 // getProxyEntrypointAddress returns the address to connect to proxy-entrypoint service.
 // If running in-cluster, it uses the service DNS name. Otherwise, it uses localhost (for port-forward).
 func getProxyEntrypointAddress() string {
+	if address := os.Getenv("PROXY_ENTRYPOINT_ADDRESS"); address != "" {
+		return address
+	}
+
 	// Running in-cluster, use service DNS name
 	namespace := os.Getenv("PROXY_ENTRYPOINT_NAMESPACE")
 	if namespace == "" {
@@ -138,6 +142,8 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 		Context("URL is vailid", func() {
 			It("should return pods information", Label("valid-url"), func() {
 				waitForClusterProxyKubeAPIAvailable()
+				_, err := clusterProxyKubeClient.CoreV1().Pods(targetNamespace).List(context.Background(), v1.ListOptions{})
+				Expect(err).To(BeNil())
 			})
 		})
 
@@ -167,7 +173,7 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 
 	Describe("Get Logs of a pod", Label("logs"), func() {
 		It("should return logs information", Label("pod-logs"), func() {
-			req := clusterProxyKubeClient.CoreV1().Pods(hubInstallNamespace).GetLogs(podName, &corev1.PodLogOptions{})
+			req := clusterProxyKubeClient.CoreV1().Pods(targetNamespace).GetLogs(podName, &corev1.PodLogOptions{})
 			podlogs, err := req.Stream(context.Background())
 			Expect(err).To(BeNil())
 			podlogs.Close()
@@ -176,11 +182,11 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 
 	Describe("Watch ConfigMap create", Label("watch"), func() {
 		It("shoud watch", Label("configmap"), func() {
-			watcher, err := clusterProxyKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Watch(context.TODO(), v1.ListOptions{})
+			watcher, err := clusterProxyKubeClient.CoreV1().ConfigMaps(targetNamespace).Watch(context.TODO(), v1.ListOptions{})
 			Expect(err).To(BeNil())
 			defer watcher.Stop()
 
-			_, err = hubKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Create(context.Background(), &corev1.ConfigMap{
+			_, err = targetKubeClient.CoreV1().ConfigMaps(targetNamespace).Create(context.Background(), &corev1.ConfigMap{
 				ObjectMeta: v1.ObjectMeta{
 					Name: "cluster-proxy-test",
 				},
@@ -192,18 +198,18 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 				return ok && event.Type == watch.Added && configMap.Name == "cluster-proxy-test"
 			})))
 
-			err = hubKubeClient.CoreV1().ConfigMaps(hubInstallNamespace).Delete(context.Background(), "cluster-proxy-test", v1.DeleteOptions{})
+			err = targetKubeClient.CoreV1().ConfigMaps(targetNamespace).Delete(context.Background(), "cluster-proxy-test", v1.DeleteOptions{})
 			Expect(err).To(BeNil())
 		})
 	})
 
 	Describe("Execute in a pod", Label("exec"), func() {
 		It("should return hello", Label("pod-exec"), func() {
-			req := clusterProxyKubeClient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace(hubInstallNamespace).SubResource("exec").Param("container", "manager")
+			req := clusterProxyKubeClient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace(targetNamespace).SubResource("exec").Param("container", podContainerName)
 
 			req.VersionedParams(&corev1.PodExecOptions{
 				Command:   []string{"/bin/sh", "-c", "echo hello"},
-				Container: "manager",
+				Container: podContainerName,
 				Stdin:     false,
 				Stdout:    true,
 				Stderr:    true,
@@ -272,6 +278,13 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 			body, err := io.ReadAll(resp.Body)
 			Expect(err).To(BeNil())
 			fmt.Println("response:", string(body))
+
+			if hostedMode {
+				Expect(resp.StatusCode).To(Equal(http.StatusOK))
+				Expect(strings.Contains(string(body), "Hello from hello-world-https")).To(BeTrue(),
+					"expected response to contain 'Hello from hello-world-https', got: %s", string(body))
+				return
+			}
 
 			// The request should either succeed (200) or fail with Bad Gateway (502).
 			// Both cases confirm the request was correctly routed to the HTTPS backend:
