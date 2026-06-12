@@ -44,8 +44,6 @@ jobs:
   unit:
     name: unit
     runs-on: ubuntu-latest
-    env:
-      CODECOV_UPLOAD_TOKEN: ${{ secrets.CODECOV_UPLOAD_TOKEN }}
     steps:
       - name: checkout code
         uses: actions/checkout@v4
@@ -56,10 +54,9 @@ jobs:
       - name: unit
         run: make test
       - name: report coverage
-        if: ${{ github.repository == 'open-cluster-management-io/cluster-proxy' || env.CODECOV_UPLOAD_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
-          token: ${{ env.CODECOV_UPLOAD_TOKEN }}
+          token: ${{ secrets.CODECOV_UPLOAD_TOKEN }}
           files: ./cover.out
           flags: unit
           name: unit
