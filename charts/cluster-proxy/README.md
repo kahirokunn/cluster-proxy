@@ -32,11 +32,57 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `proxyServer.entrypointLoadBalancer`    | Enable LoadBalancer for entrypoint | `false`                                         |
 | `proxyServer.entrypointAddress`         | Custom entrypoint address          | `""`                                            |
 | `proxyServer.port`                      | Proxy server port                  | `8091`                                          |
+| `installByPlacement.enabled`            | Install the add-on automatically via `ClusterManagementAddOn.spec.installStrategy.placements`; set to `false` to leave installation manual | `true` |
 | `installByPlacement.placementName`      | Placement name for installation    | `""`                                            |
 | `installByPlacement.placementNamespace` | Placement namespace                | `""`                                            |
 | `enableServiceProxy`                    | Enable user server deployment      | `false`                                         |
-| `userServer.enabled`                    | Auto-manage user-server cert       | `false`                                         |
-| `userServer.additionalSANs`             | Extra SANs for the generated cert  | `[]`                                            |
+| `userServer.enabled`                    | Let the controller automatically generate and rotate the `cluster-proxy-user-serving-cert` secret; when `false` the secret must be created manually | `false` |
+| `userServer.additionalSANs`             | Extra SANs (hostnames/IPs) added to the controller-generated user-server certificate | `[]` |
+| `metrics.enabled`                       | Expose hub manager metrics and create the `cluster-proxy-addon-manager-metrics` Service | `true` |
+| `metrics.port`                          | Port the manager binds for `/metrics` (matches the Service `port` and `targetPort`)     | `58080` |
+| `metrics.serviceMonitor.enabled`        | Create a Prometheus Operator `ServiceMonitor` for the manager metrics Service (requires the `monitoring.coreos.com/v1` CRD) | `false` |
+| `metrics.serviceMonitor.labels`         | Extra labels added to the generated `ServiceMonitor` (e.g. for Prometheus selector matching) | `{}` |
+
+### Hub Manager Metrics
+
+The hub addon manager exposes Prometheus metrics on `/metrics`. Metrics are
+enabled by default and served on port `58080` over HTTP. The chart provisions a
+`ClusterIP` Service named `cluster-proxy-addon-manager-metrics` that selects the
+manager pods via the `open-cluster-management.io/addon=cluster-proxy` and
+`component=cluster-proxy-manager` labels.
+
+To disable the metrics endpoint and Service entirely:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.enabled=false
+```
+
+To change the port used by both the manager `--metrics-bind-address` flag and
+the Service:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.port=9090
+```
+
+#### Prometheus Operator ServiceMonitor
+
+When the Prometheus Operator is installed in the cluster (and the
+`monitoring.coreos.com/v1` `ServiceMonitor` CRD is available), set
+`metrics.serviceMonitor.enabled=true` to have the chart create a
+`ServiceMonitor` that scrapes the manager metrics Service over HTTP. Add
+selector labels via `metrics.serviceMonitor.labels` so your Prometheus instance
+picks the resource up:
+
+```bash
+helm install cluster-proxy ./charts/cluster-proxy \
+  --set metrics.serviceMonitor.enabled=true \
+  --set metrics.serviceMonitor.labels.release=prometheus
+```
+
+The `ServiceMonitor` is only rendered when both `metrics.enabled` and
+`metrics.serviceMonitor.enabled` are `true`.
 
 ### User Server Configuration
 
@@ -49,11 +95,16 @@ helm install cluster-proxy ./charts/cluster-proxy \
 
 #### User Server Serving Certificate
 
-The user-server deployment mounts a TLS serving certificate from the `cluster-proxy-user-serving-cert` secret in the installation namespace. You can provision this secret in one of two ways.
+The user-server deployment mounts a TLS serving certificate from the
+`cluster-proxy-user-serving-cert` secret in the release namespace. You can
+provision this secret in one of two ways.
 
 **Option 1 (recommended): let the controller generate and rotate it**
 
-Set `userServer.enabled=true` so the `ManagedProxyConfiguration` requests a user-server certificate. The controller then generates the `cluster-proxy-user-serving-cert` secret in the installation namespace and rotates it automatically, so no manual secret creation is required:
+Set `userServer.enabled=true` so the `ManagedProxyConfiguration` requests a
+user-server certificate. The controller then generates the
+`cluster-proxy-user-serving-cert` secret in the release namespace and rotates
+it automatically, so no manual secret creation is required:
 
 ```bash
 helm install cluster-proxy ./charts/cluster-proxy \
@@ -61,7 +112,8 @@ helm install cluster-proxy ./charts/cluster-proxy \
   --set userServer.enabled=true
 ```
 
-Add extra hostnames or IPs to the generated certificate with `userServer.additionalSANs`:
+Add extra hostnames or IPs to the generated certificate with
+`userServer.additionalSANs`:
 
 ```bash
 helm install cluster-proxy ./charts/cluster-proxy \
@@ -72,7 +124,9 @@ helm install cluster-proxy ./charts/cluster-proxy \
 
 **Option 2: provide the certificate yourself**
 
-If you leave `userServer.enabled=false`, you MUST create the `cluster-proxy-user-serving-cert` secret in the installation namespace before the user-server pods can start:
+If you leave `userServer.enabled=false`, you MUST create the
+`cluster-proxy-user-serving-cert` secret in the release namespace before
+the user-server pods can start:
 
 ```yaml
 apiVersion: v1

@@ -22,7 +22,12 @@ flowchart TD
     C -->|Success| E{Is kubernetes.default.svc?}
 
     E -->|Yes| G{Is Managed Cluster User?}
-    E -->|No| J[Setup Reverse Proxy]
+    E -->|No| R{managed-kubeconfig configured?}
+
+    R -->|Yes| R1[Rewrite target to service-relay services/proxy subresource]
+    R -->|No| J[Setup Reverse Proxy]
+    R1 --> R2[Attach managed SA token + Cluster-Proxy routing headers]
+    R2 --> J
 
     G -->|Yes| J
     G -->|No| H{Is Hub User?}
@@ -44,13 +49,53 @@ flowchart TD
     style G fill:#bbf,stroke:#333,stroke-width:2px
     style H fill:#bbf,stroke:#333,stroke-width:2px
     style K2 fill:#bbf,stroke:#333,stroke-width:2px
+    style R fill:#bfb,stroke:#333,stroke-width:2px
 ```
 
-### 4 How to test service-proxy impersonation feature
+### 4 Hosted mode service relay
 
-Because the current e2e infrastructure doesn't support set up 2 clusters, we need to test this feature manually.
+When the addon runs in addon-framework hosted mode the service-proxy container
+runs on the hosting cluster instead of the managed cluster. With
+`enableServiceProxy=true`, non-kube-apiserver requests are always rewritten to
+the managed kube-apiserver's `services/proxy` subresource targeting the
+managed-side `cluster-proxy-service-relay` Service (configurable via
+`--service-relay-name` / `--service-relay-port`, defaults
+`cluster-proxy-service-relay`/`7444`). The full hosted-mode topology is
+documented in the top-level [README.md](../../README.md#hosted-mode).
 
-#### 4.1 Configure the LDAP test server to both clusters and create a serviceaccount on the hub cluster
+The service-proxy attaches a short-lived managed-cluster ServiceAccount token
+for both the managed kube-apiserver `services/proxy` authorization check and
+relay-side TokenReview authentication. The relay-side copy is carried in
+`Cluster-Proxy-Relay-Authorization` because Kubernetes may strip the normal
+`Authorization` header before forwarding to the backend Service. Routing
+headers carry the original scheme/host/port, and the original client
+`Authorization` header is restored only after the relay authenticates the
+trusted caller. `--managed-kubeconfig` enables this relay path.
+
+Outbound TLS for traffic that targets the managed kube-apiserver (directly or
+through the relay path) reuses the managed kubeconfig's
+`TLSClientConfig` (CA bundle, `ServerName`, optional client cert,
+`InsecureSkipVerify`) via `rest.TLSConfigFor`, so hostname verification and
+mTLS keep working when the managed kubeconfig pins them. Requests routed
+through the relay are observed via the `cluster_proxy_service_proxy_requests_total`
+(hosting) and `cluster_proxy_service_relay_requests_total` (managed) metrics.
+
+### 5 How to test service-proxy
+
+Two kinds of coverage exist for the service-proxy:
+
+- **Automated hosted e2e** — `make test-e2e-hosted` provisions three `kind`
+  clusters (hub, hosting, managed) via `test/e2e/env/init-hosted.sh` and runs
+  the suite in `test/e2e/hosted_test.go`. The `hosted-relay` labeled specs
+  exercise the Relay flow end-to-end (deployment topology, managed kubeconfig
+  provisioning, kube-apiserver impersonation, HTTP+HTTPS Service proxying,
+  Prometheus metrics, addon cleanup).
+- **Manual impersonation walkthrough** — the steps below cover the
+  non-hosted impersonation path against a real hub/managed cluster pair. The
+  current automated e2e does not stand up a second cluster with an external
+  IDP, so this scenario is verified by hand.
+
+#### 5.1 Configure the LDAP test server to both clusters and create a serviceaccount on the hub cluster
 
 First, make sure you have a hub cluster and at least one managed cluster:
 
@@ -156,7 +201,7 @@ oc create namespace test
 oc create serviceaccount test-sa -n test
 ```
 
-#### 4.2 Create Rolebinding with hub user, group and serviceaccount via ClusterPermission
+#### 5.2 Create Rolebinding with hub user, group and serviceaccount via ClusterPermission
 
 On the hub cluster, create the ClusterPermission resources:
 
@@ -243,7 +288,7 @@ test-pods                                                    Role/test-pods     
 test-services                                                Role/test-services                                                43s
 ```
 
-#### 4.3 Test the impersonation of User and Group
+#### 5.3 Test the impersonation of User and Group
 
 On the hub cluster, get token of user "einstein":
 
@@ -263,7 +308,7 @@ curl -k -H "Authorization: Bearer $TOKEN" https://$CLUSTER_PROXY_URL/cluster1/ap
 
 Both `curl` commands should return the result successfully.
 
-#### 4.4 Test the impersonation of ServiceAccount
+#### 5.4 Test the impersonation of ServiceAccount
 
 On the hub cluster, get token of serviceaccount "test-sa":
 

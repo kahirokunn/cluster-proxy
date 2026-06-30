@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
@@ -20,12 +21,14 @@ import (
 	"open-cluster-management.io/cluster-proxy/pkg/common"
 	"open-cluster-management.io/cluster-proxy/pkg/util"
 
+	"k8s.io/component-base/metrics/legacyregistry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
 var (
 	hubKubeconfig               string
+	spokeKubeconfig             string
 	clusterName                 string
 	proxyServerNamespace        string
 	enablePortForwardProxy      bool
@@ -40,10 +43,8 @@ const envKeyPodNamespace = "POD_NAMESPACE"
 // so we can access the proxy-agent's health server via localhost.
 const proxyAgentHealthAddr = "localhost:8093"
 
-// checkProxyAgentReadiness returns a health check function that checks if the proxy-agent
-// is connected to the proxy-server by querying the proxy-agent's /readyz endpoint.
-// Since both containers share the same network namespace within the Pod, this function
-// can reach the proxy-agent's health server at localhost:8093.
+// checkProxyAgentReadiness returns a health check function that reports whether
+// the proxy-agent is connected to the proxy-server, via its /readyz endpoint.
 func checkProxyAgentReadiness() func() bool {
 	client := &http.Client{Timeout: 5 * time.Second}
 	return func() bool {
@@ -69,6 +70,8 @@ func main() {
 	klog.InitFlags(flag.CommandLine)
 	flag.StringVar(&hubKubeconfig, "hub-kubeconfig", "",
 		"The kubeconfig to talk to hub cluster")
+	flag.StringVar(&spokeKubeconfig, "spoke-kubeconfig", "",
+		"The kubeconfig to talk to spoke/managed cluster. If empty, in-cluster config is used")
 	flag.StringVar(&clusterName, "cluster-name", "",
 		"The name of the managed cluster")
 	flag.StringVar(&proxyServerNamespace, "proxy-server-namespace", "open-cluster-management-addon",
@@ -88,7 +91,21 @@ func main() {
 	}
 	cfg.UserAgent = "proxy-agent-addon-agent"
 
-	spokeClient, err := kubernetes.NewForConfig(ctrl.GetConfigOrDie())
+	// In hosted mode the spoke kubeconfig points at the managed cluster, while the
+	// addon agent itself runs on the management cluster (in-cluster config).
+	hostedMode := spokeKubeconfig != ""
+
+	var spokeConfig *rest.Config
+	if hostedMode {
+		spokeConfig, err = clientcmd.BuildConfigFromFlags("", spokeKubeconfig)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		spokeConfig = ctrl.GetConfigOrDie()
+	}
+	spokeConfig.UserAgent = "proxy-agent-addon-agent-spoke"
+	spokeClient, err := kubernetes.NewForConfig(spokeConfig)
 	if err != nil {
 		panic(fmt.Errorf("failed to create spoke client, err: %w", err))
 	}
@@ -97,17 +114,30 @@ func main() {
 		panic(fmt.Sprintf("Pod namespace is empty, please set the ENV for %s", envKeyPodNamespace))
 	}
 
+	leaseClient := spokeClient
+	if hostedMode {
+		managementConfig := ctrl.GetConfigOrDie()
+		managementConfig.UserAgent = "proxy-agent-addon-agent-management"
+		leaseClient, err = kubernetes.NewForConfig(managementConfig)
+		if err != nil {
+			panic(fmt.Errorf("failed to create management client, err: %w", err))
+		}
+	}
+
 	var healthCheckFuncs []func() bool
 	if enableProxyAgentHealthCheck {
 		klog.Infof("Proxy-agent health check enabled, lease will only update when proxy-agent is connected")
 		healthCheckFuncs = []func() bool{checkProxyAgentReadiness()}
 	}
 	leaseUpdater := lease.NewLeaseUpdater(
-		spokeClient,
+		leaseClient,
 		common.AddonName,
 		addonAgentNamespace,
 		healthCheckFuncs...,
-	).WithHubLeaseConfig(cfg, clusterName)
+	)
+	if !hostedMode {
+		leaseUpdater = leaseUpdater.WithHubLeaseConfig(cfg, clusterName)
+	}
 
 	ctx := context.Background()
 
@@ -130,7 +160,11 @@ func main() {
 	}
 
 	// If the certificates is changed, we need to restart the agent to load the new certificates.
-	cc, err := addonutils.NewConfigChecker("certificates check", "/etc/tls/tls.crt", "/etc/tls/tls.key")
+	configFiles := []string{"/etc/tls/tls.crt", "/etc/tls/tls.key"}
+	if hostedMode {
+		configFiles = append(configFiles, spokeKubeconfig)
+	}
+	cc, err := addonutils.NewConfigChecker("certificates check", configFiles...)
 	if err != nil {
 		klog.Fatalf("failed create certificates checker: %v", err)
 	}
@@ -155,6 +189,7 @@ func main() {
 func serveHealthProbes(stop <-chan struct{}, address string, healthCheckers map[string]healthz.Checker) {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: healthCheckers}))
+	mux.Handle("/metrics", legacyregistry.Handler())
 
 	server := http.Server{
 		Handler: mux,

@@ -16,9 +16,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"open-cluster-management.io/addon-framework/pkg/addonfactory"
@@ -46,7 +49,15 @@ const (
 	// See more details: https://coredns.io/manual/setups/#recursive-resolver; https://github.com/golang/go/blob/6f445a9db55f65e55c5be29d3c506ecf3be37915/src/net/dnsclient_unix.go#L666
 	// The default value is "svc.cluster.local". We can also set a CustomizedVariables with key "serviceDomain" to overwrite it.
 	serviceDomain = "svc.cluster.local"
+
+	agentServiceMonitorLabelsVariable = "agentServiceMonitorLabels"
 )
+
+var serviceMonitorGVK = schema.GroupVersionKind{
+	Group:   "monitoring.coreos.com",
+	Version: "v1",
+	Kind:    "ServiceMonitor",
+}
 
 func NewAgentAddon(
 	signer selfsigned.SelfSigner,
@@ -83,6 +94,8 @@ func NewAgentAddon(
 	})
 
 	agentFactory := addonfactory.NewAgentAddonFactory(common.AddonName, FS, "manifests/charts/addon-agent").
+		WithScheme(newAgentScheme()).
+		WithAgentHostedModeEnabledOption().
 		WithAgentRegistrationOption(&agent.RegistrationOption{
 			Configurations: func(ctx context.Context, cluster *clusterv1.ManagedCluster, addon *addonv1beta1.ManagedClusterAddOn) ([]agent.RegistrationConfig, error) {
 				return regConfigs, nil
@@ -100,6 +113,16 @@ func NewAgentAddon(
 							APIGroups: []string{"coordination.k8s.io"},
 							Verbs:     []string{"*"},
 							Resources: []string{"leases"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"get"},
+							Resources: []string{"managedclusteraddons"},
+						},
+						{
+							APIGroups: []string{"addon.open-cluster-management.io"},
+							Verbs:     []string{"update"},
+							Resources: []string{"managedclusteraddons/status"},
 						},
 					},
 				}).
@@ -140,6 +163,12 @@ func NewAgentAddon(
 		WithAgentInstallNamespace(agentInstallNamespaceFunc(utils.NewAddOnDeploymentConfigGetter(addonClient)))
 
 	return agentFactory.BuildHelmAgentAddon()
+}
+
+func newAgentScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	s.AddKnownTypeWithName(serviceMonitorGVK, &unstructured.Unstructured{})
+	return s
 }
 
 // agentInstallNamespaceFunc returns namespace from AddonDeploymentConfig, and config.DefaultAddonInstallNamespace if
@@ -331,6 +360,9 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1beta1.AddOnDe
 			values[variable.Name] = variable.Value
 		}
 
+		rawServiceMonitorLabels, _ := values[agentServiceMonitorLabelsVariable].(string)
+		values[agentServiceMonitorLabelsVariable] = parseAgentServiceMonitorLabels(rawServiceMonitorLabels)
+
 		if config.Spec.NodePlacement != nil {
 			values["nodeSelector"] = config.Spec.NodePlacement.NodeSelector
 			values["tolerations"] = config.Spec.NodePlacement.Tolerations
@@ -353,4 +385,24 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1beta1.AddOnDe
 		}
 		return values, nil
 	}
+}
+
+func parseAgentServiceMonitorLabels(rawLabels string) map[string]string {
+	labels := map[string]string{}
+	rawLabels = strings.TrimSpace(rawLabels)
+	if rawLabels == "" {
+		return labels
+	}
+
+	for _, rawPair := range strings.Split(rawLabels, ",") {
+		rawKey, rawValue, ok := strings.Cut(rawPair, "=")
+		if !ok {
+			klog.Warningf("ignoring malformed %s entry %q: expected key=value", agentServiceMonitorLabelsVariable, rawPair)
+			continue
+		}
+
+		labels[strings.TrimSpace(rawKey)] = strings.TrimSpace(rawValue)
+	}
+
+	return labels
 }
