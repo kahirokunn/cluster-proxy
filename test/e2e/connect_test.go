@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -162,6 +163,79 @@ var _ = Describe("Requests through Cluster-Proxy", Label("serviceproxy", "connec
 				Expect(err).ToNot(BeNil())
 				Expect(errors.IsUnauthorized(err)).To(Equal(true))
 			})
+		})
+	})
+
+	Describe("Delegated impersonation", Label("impersonation"), func() {
+		It("should allow authorized targets and reject unauthorized targets", func() {
+			ctx := context.Background()
+			targetUser := "cluster-proxy-e2e-impersonated-user"
+
+			impersonateRole, err := hubKubeClient.RbacV1().ClusterRoles().Create(ctx, &rbacv1.ClusterRole{
+				ObjectMeta: v1.ObjectMeta{GenerateName: "cluster-proxy-e2e-impersonate-"},
+				Rules: []rbacv1.PolicyRule{{
+					APIGroups:     []string{""},
+					Resources:     []string{"users"},
+					ResourceNames: []string{targetUser},
+					Verbs:         []string{"impersonate"},
+				}},
+			}, v1.CreateOptions{})
+			Expect(err).To(BeNil())
+			DeferCleanup(func() {
+				Expect(hubKubeClient.RbacV1().ClusterRoles().Delete(ctx, impersonateRole.Name, v1.DeleteOptions{})).To(Succeed())
+			})
+
+			impersonateBinding, err := hubKubeClient.RbacV1().ClusterRoleBindings().Create(ctx, &rbacv1.ClusterRoleBinding{
+				ObjectMeta: v1.ObjectMeta{GenerateName: "cluster-proxy-e2e-impersonate-"},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: rbacv1.GroupName,
+					Kind:     "ClusterRole",
+					Name:     impersonateRole.Name,
+				},
+				Subjects: []rbacv1.Subject{{
+					Kind:      rbacv1.ServiceAccountKind,
+					Name:      serviceAccountName,
+					Namespace: hubInstallNamespace,
+				}},
+			}, v1.CreateOptions{})
+			Expect(err).To(BeNil())
+			DeferCleanup(func() {
+				Expect(hubKubeClient.RbacV1().ClusterRoleBindings().Delete(ctx, impersonateBinding.Name, v1.DeleteOptions{})).To(Succeed())
+			})
+
+			targetBinding, err := hubKubeClient.RbacV1().RoleBindings(hubInstallNamespace).Create(ctx, &rbacv1.RoleBinding{
+				ObjectMeta: v1.ObjectMeta{GenerateName: "cluster-proxy-e2e-impersonated-user-"},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: rbacv1.GroupName,
+					Kind:     "Role",
+					Name:     "podrole",
+				},
+				Subjects: []rbacv1.Subject{{
+					APIGroup: rbacv1.GroupName,
+					Kind:     rbacv1.UserKind,
+					Name:     targetUser,
+				}},
+			}, v1.CreateOptions{})
+			Expect(err).To(BeNil())
+			DeferCleanup(func() {
+				Expect(hubKubeClient.RbacV1().RoleBindings(hubInstallNamespace).Delete(ctx, targetBinding.Name, v1.DeleteOptions{})).To(Succeed())
+			})
+
+			authorizedConfig := rest.CopyConfig(clusterProxyCfg)
+			authorizedConfig.Impersonate = rest.ImpersonationConfig{UserName: targetUser}
+			authorizedClient, err := kubernetes.NewForConfig(authorizedConfig)
+			Expect(err).To(BeNil())
+			Eventually(func() error {
+				_, err := authorizedClient.CoreV1().Pods(hubInstallNamespace).List(ctx, v1.ListOptions{})
+				return err
+			}, timeout, time.Second).Should(Succeed())
+
+			deniedConfig := rest.CopyConfig(clusterProxyCfg)
+			deniedConfig.Impersonate = rest.ImpersonationConfig{UserName: "cluster-proxy-e2e-denied-user"}
+			deniedClient, err := kubernetes.NewForConfig(deniedConfig)
+			Expect(err).To(BeNil())
+			_, err = deniedClient.CoreV1().Pods(hubInstallNamespace).List(ctx, v1.ListOptions{})
+			Expect(errors.IsForbidden(err)).To(BeTrue())
 		})
 	})
 

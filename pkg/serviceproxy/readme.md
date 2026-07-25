@@ -16,35 +16,46 @@ For `local-cluster`, the service-proxy will also determine the token as a manage
 
 ```mermaid
 flowchart TD
-    A[Receive Request] --> B[Log Request if Debug Enabled]
-    B --> C[Get Target Service URL]
-    C -->|Error| D[Return 400 Bad Request]
-    C -->|Success| E{Is kubernetes.default.svc?}
-
-    E -->|Yes| G{Is Managed Cluster User?}
-    E -->|No| J[Setup Reverse Proxy]
-
-    G -->|Yes| J
-    G -->|No| H{Is Hub User?}
-
-    H -->|No| I[Return 401 Unauthorized]
-    H -->|Yes| K1[Set Impersonate Groups]
-
-    K1 --> K2{Is ServiceAccount?}
-    K2 -->|Yes| K3[Add cluster:hub: prefix]
-    K2 -->|No| K4[Use username directly]
-    K3 --> K5[Replace with Proxy SA Token]
-    K4 --> K5
-    K5 --> J
-
-    J --> L[Configure Transport]
-    L --> M[Forward Request to Target]
-
-    style E fill:#f9f,stroke:#333,stroke-width:2px
-    style G fill:#bbf,stroke:#333,stroke-width:2px
-    style H fill:#bbf,stroke:#333,stroke-width:2px
-    style K2 fill:#bbf,stroke:#333,stroke-width:2px
+    A[Receive Request] --> B[Resolve Target Service]
+    B -->|Not kube-apiserver| P[Forward Unchanged]
+    B -->|kube-apiserver| C[Extract and Remove Client Impersonate Headers]
+    C --> D{Authenticate Token}
+    D -->|Managed User| E[Use Managed Identity]
+    D -->|Hub User| F[Use Hub Identity]
+    D -->|Neither| U[Return 401]
+    E --> G{Valid Impersonation Request?}
+    F --> G
+    G -->|Malformed| V[Return 400]
+    G -->|No Impersonation| H{Hub User?}
+    G -->|Requested| I[SubjectAccessReview on Managed Cluster]
+    I -->|Denied| W[Return 403]
+    I -->|Error| X[Return 500]
+    I -->|Allowed| H
+    H -->|Managed User| J[Restore Validated Headers and Original Token]
+    H -->|Hub User| K[Set Effective or Requested Identity]
+    K --> L[Add Original User Audit Extra when Delegated]
+    L --> M[Replace Token with Proxy SA Token]
+    J --> N[Forward to Managed API]
+    M --> N
 ```
+
+Client-requested impersonation uses the managed cluster's RBAC as its only
+authorization policy. The service-proxy submits a `SubjectAccessReview` for
+every requested user, service account, group, UID, and extra value. Only
+requests for which every review is allowed are rebuilt and forwarded.
+
+For hub tokens, the managed API server sees the cluster-proxy service account
+as the authenticated user. When a hub user requests delegated impersonation,
+the service-proxy adds the following reserved user-extra fields so the managed
+cluster audit event also records the original requester:
+
+- `originaluser.open-cluster-management.io-user`
+- `originaluser.open-cluster-management.io-groups`
+- `originaluser.open-cluster-management.io-uid`
+- `originaluser.open-cluster-management.io-extra`
+
+Clients cannot set user-extra keys with the
+`originaluser.open-cluster-management.io-` prefix.
 
 ### 4 How to test service-proxy impersonation feature
 
@@ -288,3 +299,48 @@ curl -k -H "Authorization: Bearer $SA_TOKEN" https://$CLUSTER_PROXY_URL/cluster1
 ```
 
 The command should return the result successfully.
+
+#### 4.5 Test delegated end-user impersonation
+
+Grant the original user permission on the managed cluster to impersonate the
+target identity. For example, the following allows `einstein` to impersonate
+only the user `bob`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: impersonate-bob
+rules:
+- apiGroups: [""]
+  resources: ["users"]
+  resourceNames: ["bob"]
+  verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: einstein-impersonate-bob
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: impersonate-bob
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: einstein
+```
+
+The target user also needs RBAC for the requested API operation. After binding
+the appropriate workload permissions to `bob`, send:
+
+```bash
+curl -k \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Impersonate-User: bob" \
+  "https://$CLUSTER_PROXY_URL/cluster1/api/v1/namespaces/open-cluster-management-agent-addon/pods"
+```
+
+The request succeeds when both the impersonation SAR for `einstein` and the
+ordinary API authorization for `bob` allow it. A denied impersonation returns
+403; an invalid header combination returns 400; an invalid token returns 401.

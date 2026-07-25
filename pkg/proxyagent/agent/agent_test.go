@@ -443,6 +443,31 @@ func TestNewAgentAddon(t *testing.T) {
 					assert.NotNil(t, serviceProxy.ReadinessProbe.TCPSocket) {
 					assert.Equal(t, int32(constant.ServiceProxyPort), serviceProxy.ReadinessProbe.TCPSocket.Port.IntVal)
 				}
+				impersonatorRole := getAgentImpersonatorClusterRole(manifests)
+				if assert.NotNil(t, impersonatorRole) {
+					assert.ElementsMatch(t, []rbacv1.PolicyRule{
+						{
+							APIGroups: []string{""},
+							Resources: []string{"users", "groups", "serviceaccounts"},
+							Verbs:     []string{"impersonate"},
+						},
+						{
+							APIGroups: []string{"authentication.k8s.io"},
+							Resources: []string{"*"},
+							Verbs:     []string{"impersonate"},
+						},
+						{
+							APIGroups: []string{"authorization.k8s.io"},
+							Resources: []string{"subjectaccessreviews"},
+							Verbs:     []string{"create"},
+						},
+						{
+							APIGroups: []string{"authentication.k8s.io"},
+							Resources: []string{"tokenreviews"},
+							Verbs:     []string{"create"},
+						},
+					}, impersonatorRole.Rules)
+				}
 			},
 		},
 		{
@@ -703,6 +728,46 @@ func TestNewAgentAddon(t *testing.T) {
 				agentDeploy := getAgentDeployment(manifests)
 				assert.NotNil(t, agentDeploy)
 				assert.Equal(t, int32(10), *agentDeploy.Spec.Replicas)
+			},
+		},
+		{
+			name:    "service proxy with impersonation disabled",
+			cluster: newCluster(clusterName, true),
+			addon: func() *addonv1beta1.ManagedClusterAddOn {
+				addOn := newAddOn(addOnName, clusterName)
+				addOn.Status.ConfigReferences = []addonv1beta1.ConfigReference{
+					newManagedProxyConfigReference(managedProxyConfigName),
+					newAddOndDeploymentConfigReference(addOndDeployConfigName, clusterName),
+				}
+				return addOn
+			}(),
+			managedProxyConfig: newManagedProxyConfig(managedProxyConfigName, proxyv1alpha1.EntryPointTypePortForward),
+			addOndDeploymentConfigs: []runtime.Object{
+				func() *addonv1beta1.AddOnDeploymentConfig {
+					config := newAddOnDeploymentConfig(addOndDeployConfigName, clusterName)
+					config.Spec.CustomizedVariables = []addonv1beta1.CustomizedVariable{{
+						Name:  "enableImpersonation",
+						Value: "false",
+					}}
+					return config
+				}(),
+			},
+			enableKubeApiProxy: true,
+			enableServiceProxy: true,
+			verifyManifests: func(t *testing.T, manifests []runtime.Object) {
+				assert.Len(t, manifests, len(expectedManifestNamesWithServiceProxy))
+				serviceProxy := getDeploymentContainer(getAgentDeployment(manifests), "service-proxy")
+				if assert.NotNil(t, serviceProxy) {
+					assert.Contains(t, serviceProxy.Args, "--enable-impersonation=false")
+				}
+				impersonatorRole := getAgentImpersonatorClusterRole(manifests)
+				if assert.NotNil(t, impersonatorRole) {
+					assert.Equal(t, []rbacv1.PolicyRule{{
+						APIGroups: []string{"authentication.k8s.io"},
+						Resources: []string{"tokenreviews"},
+						Verbs:     []string{"create"},
+					}}, impersonatorRole.Rules)
+				}
 			},
 		},
 		{
@@ -1148,6 +1213,16 @@ func getAgentNetworkPolicy(manifests []runtime.Object) *networkingv1.NetworkPoli
 			if np.Name == "cluster-proxy-proxy-agent-network-policy" {
 				return np
 			}
+		}
+	}
+	return nil
+}
+
+func getAgentImpersonatorClusterRole(manifests []runtime.Object) *rbacv1.ClusterRole {
+	for _, manifest := range manifests {
+		if role, ok := manifest.(*rbacv1.ClusterRole); ok &&
+			role.Name == "cluster-proxy-addon-agent-impersonator" {
+			return role
 		}
 	}
 	return nil

@@ -5,8 +5,14 @@ metadata:
 rules:
 {{- if eq .Values.enableImpersonation "true" }}
 - apiGroups: [""]
-  resources: ["users", "groups"]
+  resources: ["users", "groups", "serviceaccounts"]
   verbs: ["impersonate"]
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["*"]
+  verbs: ["impersonate"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["subjectaccessreviews"]
+  verbs: ["create"]
 {{- end }}
 - apiGroups: ["authentication.k8s.io"]
   resources: ["tokenreviews"]

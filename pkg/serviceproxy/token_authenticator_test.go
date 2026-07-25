@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
@@ -32,6 +33,17 @@ func newFakeClient(authenticated bool, username string, groups []string) *fake.C
 			},
 		}
 		return true, tr, nil
+	})
+	return client
+}
+
+func newFakeImpersonationClient(allowed bool) *fake.Clientset {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		review := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview).DeepCopy()
+		review.Status.Allowed = allowed
+		review.Status.Denied = !allowed
+		return true, review, nil
 	})
 	return client
 }
@@ -71,9 +83,10 @@ func TestTokenReviewAuthenticator_Unauthenticated(t *testing.T) {
 	}
 }
 
-func TestProcessAuthentication_ManagedClusterToken(t *testing.T) {
+func TestProcessAuthentication_ManagedClusterTokenWithAuthorizedImpersonation(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableImpersonation:      true,
+		managedClusterKubeClient: newFakeImpersonationClient(true),
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return &authenticator.Response{User: &user.DefaultInfo{Name: "mc-user"}}, true, nil
 		}),
@@ -86,7 +99,6 @@ func TestProcessAuthentication_ManagedClusterToken(t *testing.T) {
 	ctx := t.Context()
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://example.com/api", nil)
 	req.Header.Set("Authorization", "Bearer mc-token")
-	// Client-supplied impersonation must be stripped even when processHubUser is not called.
 	req.Header.Set(authenticationv1.ImpersonateUserHeader, "system:admin")
 	req.Header.Add(authenticationv1.ImpersonateGroupHeader, "system:masters")
 	req.Header.Set(authenticationv1.ImpersonateUIDHeader, "escalated-uid")
@@ -96,7 +108,18 @@ func TestProcessAuthentication_ManagedClusterToken(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	assertNoImpersonationHeaders(t, req.Header)
+	if got := req.Header.Get(authenticationv1.ImpersonateUserHeader); got != "system:admin" {
+		t.Fatalf("expected authorized impersonated user, got %q", got)
+	}
+	if got := req.Header.Values(authenticationv1.ImpersonateGroupHeader); len(got) != 1 || got[0] != "system:masters" {
+		t.Fatalf("expected authorized impersonated group, got %v", got)
+	}
+	if got := req.Header.Get(authenticationv1.ImpersonateUIDHeader); got != "escalated-uid" {
+		t.Fatalf("expected authorized impersonated UID, got %q", got)
+	}
+	if got := req.Header.Get(authenticationv1.ImpersonateUserExtraHeaderPrefix + "scopes.authorization.openshift.io"); got != "user:full" {
+		t.Fatalf("expected authorized impersonated extra, got %q", got)
+	}
 }
 
 func TestProcessAuthentication_HubServiceAccountToken(t *testing.T) {
@@ -490,9 +513,10 @@ func TestProcessAuthentication_HubAuthError(t *testing.T) {
 	}
 }
 
-func TestProcessAuthentication_StripsClientImpersonationOnHubPath(t *testing.T) {
+func TestProcessAuthentication_RejectsUnauthorizedClientImpersonationOnHubPath(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableImpersonation:      true,
+		managedClusterKubeClient: newFakeImpersonationClient(false),
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, nil
 		}),
@@ -518,32 +542,17 @@ func TestProcessAuthentication_StripsClientImpersonationOnHubPath(t *testing.T) 
 	req.Header.Set(authenticationv1.ImpersonateUIDHeader, "escalated-uid")
 	req.Header.Set(authenticationv1.ImpersonateUserExtraHeaderPrefix+"scopes.authorization.openshift.io", "user:full")
 
-	if err := s.processAuthentication(ctx, req); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	err := s.processAuthentication(ctx, req)
+	if err == nil {
+		t.Fatal("expected unauthorized impersonation to fail")
 	}
-
-	if got := req.Header.Get(authenticationv1.ImpersonateUserHeader); got != "lowpriv" {
-		t.Fatalf("expected Impersonate-User from TokenReview 'lowpriv', got %q", got)
+	var processingErr *requestProcessingError
+	if !errors.As(err, &processingErr) || processingErr.statusCode != http.StatusForbidden {
+		t.Fatalf("expected forbidden request error, got %v", err)
 	}
-
-	groups := req.Header.Values(authenticationv1.ImpersonateGroupHeader)
-	if len(groups) != 1 || groups[0] != "system:authenticated" {
-		t.Fatalf("expected only authenticated group, got %v", groups)
-	}
-	for _, g := range groups {
-		if g == "system:masters" || g == "cluster-admins" {
-			t.Fatalf("client-injected group %q must not be forwarded", g)
-		}
-	}
-
-	if got := req.Header.Get(authenticationv1.ImpersonateUIDHeader); got != "" {
-		t.Fatalf("expected Impersonate-Uid stripped, got %q", got)
-	}
-	if got := req.Header.Get(authenticationv1.ImpersonateUserExtraHeaderPrefix + "scopes.authorization.openshift.io"); got != "" {
-		t.Fatalf("expected Impersonate-Extra stripped, got %q", got)
-	}
-	if req.Header.Get("Authorization") != "Bearer fake-sa-token" {
-		t.Fatalf("expected authorization header to use impersonation token, got %q", req.Header.Get("Authorization"))
+	assertNoImpersonationHeaders(t, req.Header)
+	if req.Header.Get("Authorization") != "Bearer hub-token" {
+		t.Fatalf("authorization token must not be replaced for denied impersonation, got %q", req.Header.Get("Authorization"))
 	}
 }
 
@@ -578,6 +587,7 @@ func TestStripClientImpersonationHeaders(t *testing.T) {
 	h.Add(authenticationv1.ImpersonateGroupHeader, "g2")
 	h.Set(authenticationv1.ImpersonateUIDHeader, "uid")
 	h.Set(authenticationv1.ImpersonateUserExtraHeaderPrefix+"foo", "bar")
+	h.Set("Impersonate-Future", "untrusted")
 	h.Set("Authorization", "Bearer keep-me")
 	h.Set("X-Custom", "keep-me-too")
 
@@ -604,8 +614,8 @@ func assertNoImpersonationHeaders(t *testing.T, h http.Header) {
 		t.Fatalf("expected Impersonate-Uid empty, got %q", got)
 	}
 	for key, values := range h {
-		if strings.HasPrefix(key, authenticationv1.ImpersonateUserExtraHeaderPrefix) {
-			t.Fatalf("expected Impersonate-Extra headers stripped, found %s=%v", key, values)
+		if strings.HasPrefix(strings.ToLower(key), "impersonate-") {
+			t.Fatalf("expected impersonation headers stripped, found %s=%v", key, values)
 		}
 	}
 }

@@ -300,8 +300,8 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if url.Host == "kubernetes.default.svc" {
 		if s.enableImpersonation {
 			if err := s.processAuthentication(ctx, req); err != nil {
-				logger.Error(err, "authentication failed")
-				http.Error(wr, err.Error(), http.StatusUnauthorized)
+				logger.Error(err, "request authentication or impersonation failed")
+				writeRequestProcessingError(wr, err)
 				return
 			}
 		}
@@ -353,20 +353,13 @@ func (s *serviceProxy) readImpersonateTokenFromFile() (string, error) {
 	return string(token), nil
 }
 
-// stripClientImpersonationHeaders removes any client-supplied impersonation headers.
-// Without this, Impersonate-Group/Uid/Extra values would be forwarded to the managed
-// cluster apiserver. On the hub-user path the proxy SA has broad impersonate rights on
-// users/groups, so a client could escalate by injecting Impersonate-Group (e.g.
-// system:masters) which Header.Add would keep alongside the authenticated user's groups.
-// Headers must be cleared for every auth path (including managed-cluster tokens), not only
-// inside processHubUser.
+// stripClientImpersonationHeaders removes all known and unknown Impersonate-*
+// headers. Only values retained in a validated impersonationRequest may be
+// re-applied.
 func stripClientImpersonationHeaders(h http.Header) {
-	h.Del(authenticationv1.ImpersonateUserHeader)
-	h.Del(authenticationv1.ImpersonateGroupHeader)
-	h.Del(authenticationv1.ImpersonateUIDHeader)
 	for key := range h {
-		if strings.HasPrefix(key, authenticationv1.ImpersonateUserExtraHeaderPrefix) {
-			h.Del(key)
+		if strings.HasPrefix(strings.ToLower(key), "impersonate-") {
+			delete(h, key)
 		}
 	}
 }
@@ -377,14 +370,12 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 	logger := klog.FromContext(ctx)
 	token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 
+	requestedImpersonation, impersonationInputErr := extractClientImpersonation(req.Header)
+
 	logger.V(6).Info("processing authentication for request",
 		"tokenPresent", token != "",
 		"tokenLength", len(token),
 	)
-
-	// Always drop client-provided impersonation headers before any auth path forwards the
-	// request. processHubUser will re-apply Impersonate-User/Group from the TokenReview result.
-	stripClientImpersonationHeaders(req.Header)
 
 	// try managed cluster authentication first
 	managedClusterResp, managedClusterAuthenticated, err := s.managedClusterAuthenticator.AuthenticateToken(ctx, token)
@@ -393,7 +384,8 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 			logger.V(4).Info("managed cluster token not authenticated, trying hub", "error", err)
 			managedClusterAuthenticated = false
 		} else {
-			return fmt.Errorf("managed cluster authentication failed: %v", err)
+			internalErr := fmt.Errorf("managed cluster authentication failed: %w", err)
+			return newRequestProcessingError(http.StatusInternalServerError, "Internal Server Error", internalErr)
 		}
 	}
 
@@ -407,61 +399,85 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 		)
 	}
 
-	if !managedClusterAuthenticated {
-		// try hub authentication
-		hubResp, hubAuthenticated, err := s.hubAuthenticator.AuthenticateToken(ctx, token)
-		if err != nil {
-			if errors.Is(err, ErrTokenNotAuthenticated) {
-				logger.V(4).Info("hub cluster token not authenticated", "error", err)
-				hubAuthenticated = false
-			} else {
-				logger.Error(err, "hub cluster authentication failed")
-				return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, hub cluster auth error: %v", err)
-			}
+	if managedClusterAuthenticated {
+		if impersonationInputErr != nil {
+			return impersonationInputErr
 		}
-		logger.V(4).Info("hub cluster authentication result",
-			"authenticated", hubAuthenticated,
-		)
-
-		if !hubAuthenticated {
-			logger.Error(nil, "authentication failed: token is neither valid for managed cluster nor hub cluster")
-			return fmt.Errorf("authentication failed: token is neither valid for managed cluster nor hub cluster")
+		if err := s.authorizeImpersonation(ctx, managedClusterResp.User, requestedImpersonation); err != nil {
+			return err
 		}
-
-		if err := s.processHubUser(ctx, req, hubResp.User); err != nil {
-			logger.Error(err, "failed to process hub user")
-			return fmt.Errorf("failed to process hub user: %v", err)
-		}
-
-		logger.V(6).Info("hub user processed successfully, impersonation headers applied")
+		applyImpersonationHeaders(req.Header, requestedImpersonation)
+		return nil
 	}
 
+	// try hub authentication
+	hubResp, hubAuthenticated, err := s.hubAuthenticator.AuthenticateToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, ErrTokenNotAuthenticated) {
+			logger.V(4).Info("hub cluster token not authenticated", "error", err)
+			hubAuthenticated = false
+		} else {
+			internalErr := fmt.Errorf(
+				"authentication failed: managed cluster auth: not authenticated, hub cluster auth error: %w",
+				err,
+			)
+			return newRequestProcessingError(http.StatusInternalServerError, "Internal Server Error", internalErr)
+		}
+	}
+	logger.V(4).Info("hub cluster authentication result",
+		"authenticated", hubAuthenticated,
+	)
+
+	if !hubAuthenticated {
+		err := fmt.Errorf("authentication failed: token is neither valid for managed cluster nor hub cluster")
+		logger.Error(err, "request authentication failed")
+		return newRequestProcessingError(http.StatusUnauthorized, "Unauthorized", err)
+	}
+	if impersonationInputErr != nil {
+		return impersonationInputErr
+	}
+
+	effectiveUser := effectiveHubUser(hubResp.User)
+	if err := s.authorizeImpersonation(ctx, effectiveUser, requestedImpersonation); err != nil {
+		return err
+	}
+	if err := s.processHubUserRequest(ctx, req, effectiveUser, requestedImpersonation); err != nil {
+		internalErr := fmt.Errorf("failed to process hub user: %w", err)
+		return newRequestProcessingError(http.StatusInternalServerError, "Internal Server Error", internalErr)
+	}
+
+	logger.V(6).Info("hub user processed successfully, impersonation headers applied")
 	return nil
 }
 
 // processHubUser handles the hub user specific operations including impersonation
 func (s *serviceProxy) processHubUser(ctx context.Context, req *http.Request, hubUser user.Info) error {
+	return s.processHubUserRequest(ctx, req, effectiveHubUser(hubUser), nil)
+}
+
+func (s *serviceProxy) processHubUserRequest(
+	ctx context.Context,
+	req *http.Request,
+	effectiveUser user.Info,
+	requestedImpersonation *impersonationRequest,
+) error {
 	logger := klog.FromContext(ctx)
 
-	// Ensure no leftover client Impersonate-Group values before adding authenticated groups.
-	req.Header.Del(authenticationv1.ImpersonateGroupHeader)
-	for _, group := range hubUser.GetGroups() {
-		// Add (not Set) so multiple groups are preserved after the Del above.
-		req.Header.Add(authenticationv1.ImpersonateGroupHeader, group)
-	}
-
-	// check if the hub user is serviceaccount kind, if so, add "cluster:hub:" prefix to the username
-	username := hubUser.GetName()
-	if strings.HasPrefix(username, "system:serviceaccount:") {
-		req.Header.Set(authenticationv1.ImpersonateUserHeader, fmt.Sprintf("cluster:hub:%s", username))
+	outboundImpersonation := requestedImpersonation.clone()
+	if outboundImpersonation == nil {
+		outboundImpersonation = impersonationForUser(effectiveUser)
 	} else {
-		req.Header.Set(authenticationv1.ImpersonateUserHeader, username)
+		if err := addOriginalUserAuditExtra(outboundImpersonation, effectiveUser); err != nil {
+			return err
+		}
 	}
+	applyImpersonationHeaders(req.Header, outboundImpersonation)
 
 	logger.V(4).Info("impersonation headers set for hub user",
 		"impersonateUser", req.Header.Get(authenticationv1.ImpersonateUserHeader),
-		"impersonateGroups", hubUser.GetGroups(),
-		"isServiceAccount", strings.HasPrefix(username, "system:serviceaccount:"),
+		"impersonateGroups", req.Header.Values(authenticationv1.ImpersonateGroupHeader),
+		"requester", effectiveUser.GetName(),
+		"delegated", requestedImpersonation != nil,
 	)
 
 	// replace the original token with cluster-proxy service-account token which has impersonate permission
