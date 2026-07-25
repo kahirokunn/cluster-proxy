@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunMain(t *testing.T) {
@@ -48,5 +50,19 @@ func TestRunMain(t *testing.T) {
 				t.Errorf("flush count = %d, want %d", flushes, test.wantFlushes)
 			}
 		})
+	}
+}
+
+func TestSignalContextPreservesParentCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, stop := newSignalContext(parent)
+	defer stop()
+
+	cancelParent()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("signal context did not propagate parent cancellation")
 	}
 }

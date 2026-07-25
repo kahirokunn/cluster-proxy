@@ -17,7 +17,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"open-cluster-management.io/cluster-proxy/pkg/proxyserver/operator/authentication/selfsigned"
@@ -46,7 +45,7 @@ func NewControllersCommand() *cobra.Command {
 		Use:   "controllers",
 		Short: "controllers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runControllerManager()
+			return runControllerManager(cmd.Context())
 		},
 	}
 
@@ -63,8 +62,8 @@ func addFlags(cmd *cobra.Command) {
 		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
 }
 
-func runControllerManager() error {
-	ctx, cancel := context.WithCancel(signals.SetupSignalHandler())
+func runControllerManager(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Setup clients, informers and listers.
@@ -82,7 +81,7 @@ func runControllerManager() error {
 	informerFactory := informers.NewSharedInformerFactory(nativeClient, 10*time.Minute)
 	secertLister := informerFactory.Core().V1().Secrets().Lister()
 
-	go informerFactory.Start(ctx.Done())
+	go informerFactory.Start(runCtx.Done())
 
 	// New controller manager
 	mgr, err := manager.New(kubeConfig, manager.Options{
@@ -108,7 +107,7 @@ func runControllerManager() error {
 		return fmt.Errorf("set up proxy client: %w", err)
 	}
 	proxyConfig, err := proxyClient.ProxyV1alpha1().ManagedProxyConfigurations().Get(
-		context.TODO(), "cluster-proxy", metav1.GetOptions{})
+		runCtx, "cluster-proxy", metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get ManagedProxyConfiguration %q: %w", "cluster-proxy", err)
 	}
@@ -122,7 +121,7 @@ func runControllerManager() error {
 		return fmt.Errorf("set up cert controller: %w", err)
 	}
 
-	if err := mgr.Start(ctx); err != nil {
+	if err := mgr.Start(runCtx); err != nil {
 		klog.Error(err, "problem running manager")
 		return fmt.Errorf("run controller manager: %w", err)
 	}

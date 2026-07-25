@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	goflag "flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -41,7 +44,14 @@ func runMain(executeCommand func() error, stderr io.Writer, flushLogs func()) in
 }
 
 func execute() error {
-	return newClusterProxyCommand().Execute()
+	ctx, stop := newSignalContext(context.Background())
+	defer stop()
+
+	return newClusterProxyCommand().ExecuteContext(ctx)
+}
+
+func newSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
 
 func newClusterProxyCommand() *cobra.Command {
