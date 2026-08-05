@@ -37,7 +37,8 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `installByPlacement.placementNamespace` | Namespace containing the Placement                               | Release namespace when empty                    |
 | `enableKubeApiProxy`                    | Enable Kubernetes API proxy support                               | `true`                                          |
 | `enableServiceProxy`                    | Deploy the hub user-server and managed cluster service-proxy      | `false`                                         |
-| `enableImpersonation`                   | Grant hub permissions required for service-proxy impersonation    | `true`                                          |
+| `enableHubTokenAuthentication`          | Grant hub permissions required for hub-token authentication        | `null` (inherits `enableImpersonation`)          |
+| `enableImpersonation`                   | Deprecated alias for `enableHubTokenAuthentication`               | `true`                                          |
 | `featureGates.clusterProfile`           | Enable ClusterProfile integration                                | `false`                                         |
 | `userServer.enabled`                    | Generate and rotate the user-server serving certificate          | `false`                                         |
 | `userServer.additionalSANs`             | Extra SANs for the generated user-server certificate             | `[]`                                            |
@@ -55,13 +56,13 @@ helm install cluster-proxy ./charts/cluster-proxy \
   --namespace open-cluster-management-addon \
   --create-namespace \
   --set enableServiceProxy=true \
-  --set enableImpersonation=true \
+  --set enableHubTokenAuthentication=true \
   --set userServer.enabled=true
 ```
 
-`enableImpersonation` defaults to true. Keep it enabled when using hub tokens
-or external OIDC tokens. With impersonation enabled, managed-cluster-issued
-tokens continue to use the managed cluster TokenReview path.
+`enableHubTokenAuthentication` inherits the deprecated
+`enableImpersonation=true` default when unset. If both values are set,
+`enableHubTokenAuthentication` takes precedence.
 
 #### User Server Serving Certificate
 
@@ -132,7 +133,6 @@ helm upgrade --install cluster-proxy ./charts/cluster-proxy \
   --namespace open-cluster-management-addon \
   --create-namespace \
   --set enableServiceProxy=true \
-  --set enableImpersonation=true \
   --set userServer.enabled=true
 ```
 
