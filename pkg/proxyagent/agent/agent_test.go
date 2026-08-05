@@ -14,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -997,7 +998,9 @@ func TestNewAgentAddon(t *testing.T) {
 				return
 			}
 			assert.NoError(t, err)
-			assertPodSecurityContext(t, getAgentDeployment(manifests))
+			agentDeployment := getAgentDeployment(manifests)
+			assertPodSecurityContext(t, agentDeployment)
+			assertSafeRolloutConfig(t, agentDeployment, 3)
 			c.verifyManifests(t, manifests)
 		})
 	}
@@ -1017,6 +1020,37 @@ func assertPodSecurityContext(t *testing.T, deploy *appsv1.Deployment) {
 	}
 	assert.Equal(t, expected, deploy.Spec.Template.Spec.SecurityContext)
 	assert.Equal(t, ptr.To(int64(40)), deploy.Spec.Template.Spec.TerminationGracePeriodSeconds)
+}
+
+func assertSafeRolloutConfig(t *testing.T, deploy *appsv1.Deployment, expectedServerConnections int32) {
+	t.Helper()
+
+	if !assert.NotNil(t, deploy) {
+		return
+	}
+	proxyAgent := getDeploymentContainer(deploy, "proxy-agent")
+	if assert.NotNil(t, proxyAgent) {
+		if assert.NotNil(t, proxyAgent.StartupProbe) && assert.NotNil(t, proxyAgent.StartupProbe.HTTPGet) {
+			assert.Equal(t, "/startupz", proxyAgent.StartupProbe.HTTPGet.Path)
+			assert.Equal(t, int32(8888), proxyAgent.StartupProbe.HTTPGet.Port.IntVal)
+			assert.Equal(t, int32(150), proxyAgent.StartupProbe.FailureThreshold)
+			assert.Equal(t, int32(2), proxyAgent.StartupProbe.PeriodSeconds)
+			assert.Equal(t, int32(1), proxyAgent.StartupProbe.TimeoutSeconds)
+		}
+		if assert.NotNil(t, proxyAgent.ReadinessProbe) && assert.NotNil(t, proxyAgent.ReadinessProbe.HTTPGet) {
+			assert.Equal(t, "/readyz", proxyAgent.ReadinessProbe.HTTPGet.Path)
+			assert.Equal(t, int32(8093), proxyAgent.ReadinessProbe.HTTPGet.Port.IntVal)
+			assert.Equal(t, int32(3), proxyAgent.ReadinessProbe.FailureThreshold)
+			assert.Equal(t, int32(2), proxyAgent.ReadinessProbe.PeriodSeconds)
+			assert.Equal(t, int32(1), proxyAgent.ReadinessProbe.TimeoutSeconds)
+		}
+	}
+
+	addonAgent := getDeploymentContainer(deploy, "addon-agent")
+	if assert.NotNil(t, addonAgent) {
+		assert.Contains(t, addonAgent.Args,
+			"--expected-proxy-server-connections="+strconv.Itoa(int(expectedServerConnections)))
+	}
 }
 
 type fakeSelfSigner struct {
@@ -1171,6 +1205,7 @@ func newManagedProxyConfig(name string, entryPointType proxyv1alpha1.EntryPointT
 		},
 		Spec: proxyv1alpha1.ManagedProxyConfigurationSpec{
 			ProxyServer: proxyv1alpha1.ManagedProxyConfigurationProxyServer{
+				Replicas: 3,
 				Entrypoint: &proxyv1alpha1.ManagedProxyConfigurationProxyServerEntrypoint{
 					Type: entryPointType,
 					LoadBalancerService: &proxyv1alpha1.EntryPointLoadBalancerService{
@@ -1183,7 +1218,8 @@ func newManagedProxyConfig(name string, entryPointType proxyv1alpha1.EntryPointT
 				Namespace: "test",
 			},
 			ProxyAgent: proxyv1alpha1.ManagedProxyConfigurationProxyAgent{
-				Image: "quay.io/open-cluster-management.io/cluster-proxy-agent:test",
+				Image:    "quay.io/open-cluster-management.io/cluster-proxy-agent:test",
+				Replicas: 1,
 			},
 		},
 	}

@@ -63,6 +63,10 @@ const (
 
 	// defaultKubeClientBurst is the default burst for kube clients used by service-proxy.
 	defaultKubeClientBurst = 100
+
+	// serviceProxyDrainPropagationDelay keeps accepting requests while the
+	// proxy-agent's DRAIN state reaches every proxy-server.
+	serviceProxyDrainPropagationDelay = 5 * time.Second
 )
 
 type serviceProxy struct {
@@ -287,8 +291,9 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	publicServer := utils.NewHTTPServer(fmt.Sprintf(":%d", constant.ServiceProxyPort), tlsConfig, s)
 
 	klog.Infof("starting service proxy HTTPS server on %d and health server on 8000", constant.ServiceProxyPort)
-	return utils.RunHTTPServers(
+	return utils.RunHTTPServersWithShutdownDelay(
 		runCtx,
+		serviceProxyDrainPropagationDelay,
 		utils.DefaultHTTPShutdownTimeout,
 		utils.RunnableHTTPServer{
 			Name:   "service proxy",

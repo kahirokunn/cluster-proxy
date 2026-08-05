@@ -231,6 +231,7 @@ func GetClusterProxyValueFunc(
 			"--hub-kubeconfig=/etc/kubeconfig/kubeconfig",
 			"--cluster-name=" + cluster.Name,
 			"--proxy-server-namespace=" + proxyConfig.Spec.ProxyServer.Namespace,
+			"--expected-proxy-server-connections=" + strconv.Itoa(int(proxyConfig.Spec.ProxyServer.Replicas)),
 		}
 		annotations := make(map[string]string)
 		switch proxyConfig.Spec.ProxyServer.Entrypoint.Type {

@@ -145,6 +145,101 @@ func TestRunHTTPServersDrainsActiveRequestOnCancellation(t *testing.T) {
 	}
 }
 
+func TestRunHTTPServersWithShutdownDelayKeepsServingBeforeDrain(t *testing.T) {
+	server := NewHTTPServer("", nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "still serving")
+	}))
+	listener := newTestListener(t)
+	serveStarted := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	const shutdownDelay = 80 * time.Millisecond
+	go func() {
+		runResult <- RunHTTPServersWithShutdownDelay(ctx, shutdownDelay, time.Second, RunnableHTTPServer{
+			Name:   "public",
+			Server: server,
+			Serve: func() error {
+				close(serveStarted)
+				return server.Serve(listener)
+			},
+		})
+	}()
+	<-serveStarted
+
+	shutdownStarted := time.Now()
+	cancel()
+	response, err := (&http.Client{Timeout: time.Second}).Get("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatalf("request during shutdown delay failed: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read response during shutdown delay: %v", err)
+	}
+	if string(body) != "still serving" {
+		t.Fatalf("unexpected response during shutdown delay: %q", body)
+	}
+
+	if err := <-runResult; err != nil {
+		t.Fatalf("delayed shutdown returned an error: %v", err)
+	}
+	if elapsed := time.Since(shutdownStarted); elapsed < shutdownDelay {
+		t.Fatalf("server stopped before shutdown delay elapsed: %v", elapsed)
+	}
+	connection, err := net.DialTimeout("tcp", listener.Addr().String(), 50*time.Millisecond)
+	if err == nil {
+		connection.Close()
+		t.Fatal("listener remained open after delayed shutdown")
+	}
+}
+
+func TestRunHTTPServersWithShutdownDelaySkipsDelayOnServerFailure(t *testing.T) {
+	listener := newTestListener(t)
+	peer := NewHTTPServer("", nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	peerStarted := make(chan struct{})
+	wantErr := errors.New("health listener failed")
+
+	started := time.Now()
+	err := RunHTTPServersWithShutdownDelay(context.Background(), time.Second, time.Second,
+		RunnableHTTPServer{
+			Name:   "public",
+			Server: peer,
+			Serve: func() error {
+				close(peerStarted)
+				return peer.Serve(listener)
+			},
+		},
+		RunnableHTTPServer{
+			Name:   "health probe",
+			Server: &http.Server{},
+			Serve: func() error {
+				<-peerStarted
+				return wantErr
+			},
+		},
+	)
+
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("server failure was not propagated: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("server failure waited for shutdown delay: %v", elapsed)
+	}
+}
+
+func TestRunHTTPServersWithShutdownDelayRejectsNegativeDelay(t *testing.T) {
+	err := RunHTTPServersWithShutdownDelay(
+		context.Background(),
+		-time.Second,
+		time.Second,
+		RunnableHTTPServer{Name: "public", Server: &http.Server{}, Serve: func() error { return nil }},
+	)
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("negative shutdown delay error = %v", err)
+	}
+}
+
 func TestRunHTTPServersPropagatesFailureAndStopsPeer(t *testing.T) {
 	listener := newTestListener(t)
 	peer := NewHTTPServer("", nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

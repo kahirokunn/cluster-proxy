@@ -197,8 +197,23 @@ type httpServerResult struct {
 // RunHTTPServers serves until the context is canceled or a server stops, then
 // drains active and hijacked requests within shutdownTimeout.
 func RunHTTPServers(ctx context.Context, shutdownTimeout time.Duration, servers ...RunnableHTTPServer) error {
+	return RunHTTPServersWithShutdownDelay(ctx, 0, shutdownTimeout, servers...)
+}
+
+// RunHTTPServersWithShutdownDelay keeps serving for shutdownDelay after context
+// cancellation, then drains active and hijacked requests within shutdownTimeout.
+// A server failure skips the delay and stops its peers immediately.
+func RunHTTPServersWithShutdownDelay(
+	ctx context.Context,
+	shutdownDelay time.Duration,
+	shutdownTimeout time.Duration,
+	servers ...RunnableHTTPServer,
+) error {
 	if err := validateHTTPServers(servers); err != nil {
 		return err
+	}
+	if shutdownDelay < 0 {
+		return fmt.Errorf("HTTP server shutdown delay must not be negative")
 	}
 	if ctx.Err() != nil {
 		return nil
@@ -224,6 +239,20 @@ func RunHTTPServers(ctx context.Context, shutdownTimeout time.Duration, servers 
 	var completed []httpServerResult
 	select {
 	case <-ctx.Done():
+		if shutdownDelay > 0 {
+			timer := time.NewTimer(shutdownDelay)
+			select {
+			case <-timer.C:
+			case result := <-results:
+				completed = append(completed, result)
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+		}
 	case result := <-results:
 		completed = append(completed, result)
 	}

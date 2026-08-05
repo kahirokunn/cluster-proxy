@@ -43,6 +43,14 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `userServer.additionalSANs`             | Extra SANs for the generated user-server certificate             | `[]`                                            |
 | `networkPolicies.enabled`               | Create opt-in NetworkPolicies for hub and managed workloads       | `false`                                         |
 
+When overriding `proxyAgentImage`, use an apiserver-network-proxy-compatible
+agent image that serves `GET /readyz` and `GET /metrics` on port `8093`. The
+metrics response must include
+`konnectivity_network_proxy_agent_open_server_connections`. During an update,
+the new Pod stays in startup until this value reaches the configured
+`spec.proxyServer.replicas`; for example, a three-server installation requires
+the metric value to reach `3` before Kubernetes terminates the old Pod.
+
 ### Service Proxy and User Server Configuration
 
 The user-server accepts HTTP requests over HTTPS on the hub and sends them

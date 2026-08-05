@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,11 +30,12 @@ import (
 )
 
 var (
-	hubKubeconfig               string
-	clusterName                 string
-	proxyServerNamespace        string
-	enablePortForwardProxy      bool
-	enableProxyAgentHealthCheck bool
+	hubKubeconfig                  string
+	clusterName                    string
+	proxyServerNamespace           string
+	enablePortForwardProxy         bool
+	enableProxyAgentHealthCheck    bool
+	expectedProxyServerConnections int
 )
 
 // envKeyPodNamespace represents the environment variable key for the addon agent namespace.
@@ -38,7 +44,11 @@ const envKeyPodNamespace = "POD_NAMESPACE"
 // proxyAgentHealthAddr is the address of the proxy-agent health server.
 // The addon-agent and proxy-agent containers run in the same Pod and share the network namespace,
 // so we can access the proxy-agent's health server via localhost.
-const proxyAgentHealthAddr = "localhost:8093"
+const (
+	proxyAgentHealthAddr                  = "localhost:8093"
+	proxyAgentMetricsURL                  = "http://" + proxyAgentHealthAddr + "/metrics"
+	proxyAgentOpenServerConnectionsMetric = "konnectivity_network_proxy_agent_open_server_connections"
+)
 
 // checkProxyAgentReadiness returns a health check function that checks if the proxy-agent
 // is connected to the proxy-server by querying the proxy-agent's /readyz endpoint.
@@ -62,6 +72,73 @@ func checkProxyAgentReadiness() func() bool {
 	}
 }
 
+// checkProxyAgentStartup verifies that a newly started proxy-agent has connected
+// to every configured proxy-server before Kubernetes can replace the old Pod.
+func checkProxyAgentStartup(client *http.Client, metricsURL string, expectedConnections int) healthz.Checker {
+	return func(request *http.Request) error {
+		metricsRequest, err := http.NewRequestWithContext(request.Context(), http.MethodGet, metricsURL, nil)
+		if err != nil {
+			return fmt.Errorf("create proxy-agent metrics request: %w", err)
+		}
+
+		response, err := client.Do(metricsRequest)
+		if err != nil {
+			return fmt.Errorf("get proxy-agent metrics: %w", err)
+		}
+		defer response.Body.Close()
+
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("get proxy-agent metrics: unexpected HTTP status %d", response.StatusCode)
+		}
+
+		connections, err := parseOpenServerConnections(io.LimitReader(response.Body, 1<<20))
+		if err != nil {
+			return err
+		}
+		if connections < int64(expectedConnections) {
+			return fmt.Errorf("proxy-agent has %d open proxy-server connections, want at least %d", connections, expectedConnections)
+		}
+		return nil
+	}
+}
+
+func parseOpenServerConnections(metrics io.Reader) (int64, error) {
+	scanner := bufio.NewScanner(metrics)
+	found := false
+	var connections int64
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != proxyAgentOpenServerConnectionsMetric {
+			continue
+		}
+		if found {
+			return 0, fmt.Errorf("proxy-agent metric %q appears more than once", proxyAgentOpenServerConnectionsMetric)
+		}
+		if len(fields) < 2 || len(fields) > 3 {
+			return 0, fmt.Errorf("proxy-agent metric %q has an invalid sample", proxyAgentOpenServerConnectionsMetric)
+		}
+
+		value, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value != math.Trunc(value) || value > math.MaxInt64 {
+			return 0, fmt.Errorf("proxy-agent metric %q has invalid value %q", proxyAgentOpenServerConnectionsMetric, fields[1])
+		}
+		connections = int64(value)
+		found = true
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read proxy-agent metrics: %w", err)
+	}
+	if !found {
+		return 0, fmt.Errorf("proxy-agent metric %q is missing", proxyAgentOpenServerConnectionsMetric)
+	}
+	return connections, nil
+}
+
 func main() {
 
 	logger := textlogger.NewLogger(textlogger.NewConfig())
@@ -77,7 +154,12 @@ func main() {
 		"If true, running a local server forwarding tunnel shakes to proxy-server pods")
 	flag.BoolVar(&enableProxyAgentHealthCheck, "enable-proxy-agent-health-check", true,
 		"If true, check proxy-agent connection status before updating lease")
+	flag.IntVar(&expectedProxyServerConnections, "expected-proxy-server-connections", 1,
+		"Number of proxy-server connections required before the proxy-agent startup probe succeeds")
 	flag.Parse()
+	if expectedProxyServerConnections < 1 {
+		klog.Fatalf("expected-proxy-server-connections must be at least 1, got %d", expectedProxyServerConnections)
+	}
 
 	// pipe controller-runtime logs to klog
 	ctrl.SetLogger(logger)
@@ -144,20 +226,26 @@ func main() {
 			}
 			return nil
 		},
-	})
+	}, checkProxyAgentStartup(
+		&http.Client{Timeout: time.Second},
+		proxyAgentMetricsURL,
+		expectedProxyServerConnections,
+	))
 
 	klog.Infof("Starting lease updater")
 	leaseUpdater.Start(ctx)
 	<-ctx.Done()
 }
 
-// serveHealthProbes starts a server to check healthz and readyz probes
-func serveHealthProbes(stop <-chan struct{}, address string, healthCheckers map[string]healthz.Checker) {
-	mux := http.NewServeMux()
-	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: healthCheckers}))
-
+// serveHealthProbes starts the addon health and proxy-agent startup probe server.
+func serveHealthProbes(
+	stop <-chan struct{},
+	address string,
+	healthCheckers map[string]healthz.Checker,
+	startupChecker healthz.Checker,
+) {
 	server := http.Server{
-		Handler: mux,
+		Handler: newHealthProbeHandler(healthCheckers, startupChecker),
 	}
 
 	ln, err := net.Listen("tcp", address)
@@ -179,4 +267,13 @@ func serveHealthProbes(stop <-chan struct{}, address string, healthCheckers map[
 	if err := server.Shutdown(context.Background()); err != nil {
 		klog.Fatal(err)
 	}
+}
+
+func newHealthProbeHandler(healthCheckers map[string]healthz.Checker, startupChecker healthz.Checker) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: healthCheckers}))
+	mux.Handle("/startupz", http.StripPrefix("/startupz", &healthz.Handler{Checks: map[string]healthz.Checker{
+		"proxy-agent-server-connections": startupChecker,
+	}}))
+	return mux
 }
