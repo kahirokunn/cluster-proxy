@@ -505,8 +505,12 @@ func TestNewAgentAddon(t *testing.T) {
 				serviceProxy := getDeploymentContainer(agentDeploy, "service-proxy")
 				if assert.NotNil(t, serviceProxy) {
 					if assert.NotNil(t, serviceProxy.ReadinessProbe) &&
-						assert.NotNil(t, serviceProxy.ReadinessProbe.TCPSocket) {
-						assert.Equal(t, int32(constant.ServiceProxyPort), serviceProxy.ReadinessProbe.TCPSocket.Port.IntVal)
+						assert.NotNil(t, serviceProxy.ReadinessProbe.HTTPGet) {
+						assert.Equal(t, corev1.URISchemeHTTPS, serviceProxy.ReadinessProbe.HTTPGet.Scheme)
+						assert.Equal(t, "/readyz", serviceProxy.ReadinessProbe.HTTPGet.Path)
+						assert.Equal(t, int32(constant.ServiceProxyPort), serviceProxy.ReadinessProbe.HTTPGet.Port.IntVal)
+						assert.Equal(t, int32(5), serviceProxy.ReadinessProbe.InitialDelaySeconds)
+						assert.Equal(t, int32(2), serviceProxy.ReadinessProbe.PeriodSeconds)
 					}
 					// oidc flags must not be rendered when the oidc variables are unset
 					for _, arg := range serviceProxy.Args {

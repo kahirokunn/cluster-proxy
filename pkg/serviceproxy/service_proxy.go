@@ -291,10 +291,34 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	httpserver := &http.Server{
 		Addr:      fmt.Sprintf(":%d", constant.ServiceProxyPort),
 		TLSConfig: tlsConfig,
-		Handler:   s,
+		Handler:   serviceProxyHandler(s),
 	}
 
 	return httpserver.ListenAndServeTLS(s.cert, s.key)
+}
+
+const serviceProxyReadinessPath = "/readyz"
+
+func serviceProxyHandler(proxy http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if isDirectReadinessRequest(req) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		proxy.ServeHTTP(w, req)
+	})
+}
+
+func isDirectReadinessRequest(req *http.Request) bool {
+	if req.Method != http.MethodGet || req.URL.Path != serviceProxyReadinessPath {
+		return false
+	}
+
+	return req.Header.Get(utils.HeaderClusterProxyProto) == "" &&
+		req.Header.Get(utils.HeaderClusterProxyNamespace) == "" &&
+		req.Header.Get(utils.HeaderClusterProxyService) == "" &&
+		req.Header.Get(utils.HeaderClusterProxyPort) == ""
 }
 
 func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {

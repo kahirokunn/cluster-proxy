@@ -92,6 +92,78 @@ func TestNewProxyTransportPreservesConfiguration(t *testing.T) {
 	}
 }
 
+func TestServiceProxyHandlerReadiness(t *testing.T) {
+	tests := []struct {
+		name       string
+		request    func() *http.Request
+		wantStatus int
+		wantProxy  bool
+	}{
+		{
+			name: "direct HTTPS readiness request",
+			request: func() *http.Request {
+				return httptest.NewRequest(http.MethodGet, "https://service-proxy.example/readyz", nil)
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name: "proxied kube-apiserver readiness request",
+			request: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "https://service-proxy.example/readyz", nil)
+				req.Header.Set(utils.HeaderClusterProxyProto, "https")
+				req.Header.Set(utils.HeaderClusterProxyNamespace, "default")
+				req.Header.Set(utils.HeaderClusterProxyService, "kubernetes")
+				req.Header.Set(utils.HeaderClusterProxyPort, "443")
+				return req
+			},
+			wantStatus: http.StatusOK,
+			wantProxy:  true,
+		},
+		{
+			name: "partially routed request",
+			request: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "https://service-proxy.example/readyz", nil)
+				req.Header.Set(utils.HeaderClusterProxyProto, "https")
+				return req
+			},
+			wantStatus: http.StatusBadRequest,
+			wantProxy:  true,
+		},
+		{
+			name: "non-GET readiness request",
+			request: func() *http.Request {
+				return httptest.NewRequest(http.MethodPost, "https://service-proxy.example/readyz", nil)
+			},
+			wantStatus: http.StatusBadRequest,
+			wantProxy:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyCalls := 0
+			handler := serviceProxyHandler(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				proxyCalls++
+				if _, err := utils.GetTargetServiceURLFromRequest(req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			recorder := httptest.NewRecorder()
+
+			handler.ServeHTTP(recorder, tt.request())
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("unexpected status: got %d, want %d", recorder.Code, tt.wantStatus)
+			}
+			if got := proxyCalls > 0; got != tt.wantProxy {
+				t.Fatalf("proxy called=%t, want %t", got, tt.wantProxy)
+			}
+		})
+	}
+}
+
 func TestServeHTTPReusesSharedTransport(t *testing.T) {
 	transport := &recordingRoundTripper{}
 	s := &serviceProxy{proxyTransport: transport}
