@@ -153,6 +153,7 @@ func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
 	flags.StringVar(&s.oidc.groupsPrefix, "oidc-groups-prefix", "", "The prefix prepended to group claims to prevent clashes with existing groups.")
 	flags.StringSliceVar(&s.oidc.reservedNamePrefixes, "oidc-reserved-name-prefixes", []string{"system:"}, "Comma-separated list of prefixes that authenticated OIDC usernames and groups must not use. The list replaces the default; set an empty value to disable the check.")
 	flags.StringVar(&s.oidc.caFile, "oidc-ca-file", "", "The path to a CA bundle used to verify the OIDC issuer's serving certificate. Defaults to the host's root CAs.")
+	flags.StringVar(&s.oidc.caConfigMap, "oidc-ca-configmap", "", "The name of a ConfigMap in POD_NAMESPACE containing the OIDC issuer CA under ca.crt. The ConfigMap is watched and reconciled when it changes. Mutually exclusive with --oidc-ca-file.")
 	flags.StringSliceVar(&s.oidc.signingAlgs, "oidc-signing-algs", []string{"RS256"}, "Comma-separated list of allowed JOSE asymmetric signing algorithms for OIDC tokens.")
 	flags.Var(cliflag.NewMapStringStringNoSplit(&s.oidc.requiredClaims), "oidc-required-claim", "A key=value pair that must be present in the OIDC ID token. Repeat this flag to require multiple claims.")
 
@@ -272,14 +273,30 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	// initialize the OIDC authenticator when configured; it is not wrapped in
 	// the token cache because the delegate verifies tokens against its own
 	// cached JWKS instead of calling an apiserver per token
+	var oidcAuth *oidcAuthenticator
 	if s.oidc.issuerURL != "" {
-		s.oidcAuthenticator = newOIDCAuthenticator(ctx, s.oidc)
+		oidcAuth, err = newOIDCAuthenticator(ctx, s.oidc)
+		if err != nil {
+			return err
+		}
+		s.oidcAuthenticator = oidcAuth
 		klog.Infof("OIDC authentication enabled: issuer=%s, clientID=%s, usernameClaim=%s", s.oidc.issuerURL, s.oidc.clientID, s.oidc.usernameClaim)
 	}
 
 	podNamespace := os.Getenv("POD_NAMESPACE")
 	if len(podNamespace) == 0 {
 		return errors.New("pod namespace is empty, please set the POD_NAMESPACE environment variable")
+	}
+	if oidcAuth != nil && s.oidc.caConfigMap != "" {
+		if err := startOIDCCAConfigMapController(
+			ctx,
+			s.managedClusterKubeClient,
+			podNamespace,
+			s.oidc.caConfigMap,
+			oidcAuth,
+		); err != nil {
+			return fmt.Errorf("failed to start OIDC CA ConfigMap controller: %w", err)
+		}
 	}
 
 	sdkTLSConfig, err := sdktls.StartTLSConfigMapWatcher(ctx, s.managedClusterKubeClient, podNamespace, func() {

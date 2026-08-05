@@ -57,8 +57,8 @@ var _ = Describe("OIDC Authentication Test", Label("serviceproxy", "oidc"), Orde
 		dexCA := dexTLSSecret.Data["ca.crt"]
 		Expect(dexCA).ToNot(BeEmpty())
 
-		By("Create or refresh the OIDC CA ConfigMap in the spoke addon namespace")
-		applyConfigMap(managedClusterInstallNamespace, oidcCAConfigMapName, map[string]string{"ca.crt": string(dexCA)})
+		By("Ensure the OIDC CA ConfigMap is initially absent")
+		deleteConfigMap(managedClusterInstallNamespace, oidcCAConfigMapName)
 
 		By("Cleanup existing AddOnDeploymentConfig if any")
 		Expect(deleteAddOnDeploymentConfig(oidcDeployConfigName)).To(Succeed())
@@ -114,6 +114,18 @@ var _ = Describe("OIDC Authentication Test", Label("serviceproxy", "oidc"), Orde
 		By("Wait for the oidc flags to appear in the service-proxy container")
 		waitServiceProxyOIDCArgs(true)
 		waitManagedClusterAddonAvailable()
+		proxyAgentBeforeCA, err := getProxyAgentDeployment()
+		Expect(err).ToNot(HaveOccurred())
+
+		By("Create the OIDC CA ConfigMap after service-proxy is running")
+		applyConfigMap(managedClusterInstallNamespace, oidcCAConfigMapName, map[string]string{"ca.crt": string(dexCA)})
+
+		By("Ensure CA reconciliation does not roll out the proxy agent")
+		Consistently(func() int64 {
+			proxyAgent, err := getProxyAgentDeployment()
+			Expect(err).ToNot(HaveOccurred())
+			return proxyAgent.Generation
+		}).WithTimeout(10 * time.Second).WithPolling(time.Second).Should(Equal(proxyAgentBeforeCA.Generation))
 
 		By("Obtain a real ID token from Dex via the password grant")
 		dexPool, err := certutil.NewPoolFromBytes(dexCA)
@@ -136,8 +148,8 @@ var _ = Describe("OIDC Authentication Test", Label("serviceproxy", "oidc"), Orde
 	})
 
 	It("should report the impersonated OIDC identity", func() {
-		// the first request also triggers the service-proxy's lazy OIDC
-		// provider discovery, hence the Eventually
+		// ConfigMap reconciliation starts provider discovery asynchronously, so
+		// allow the Kubernetes OIDC authenticator to finish its initial attempt.
 		Eventually(func() error {
 			review, err := oidcProxyClient.AuthenticationV1().SelfSubjectReviews().Create(
 				context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})

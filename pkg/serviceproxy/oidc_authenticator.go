@@ -2,10 +2,13 @@ package serviceproxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -32,23 +35,63 @@ type oidcOptions struct {
 	groupsClaim          string
 	groupsPrefix         string
 	caFile               string
+	caConfigMap          string
 	signingAlgs          []string
 	requiredClaims       map[string]string
 	reservedNamePrefixes []string
 }
 
-// oidcAuthenticator lazily creates Kubernetes' OIDC authenticator on first use,
-// so an issuer or CA file that is not ready at pod startup does not fail startup.
+type oidcDelegateFactory func(
+	context.Context,
+	[]byte,
+) (oidcauthenticator.AuthenticatorTokenWithHealthCheck, func(), error)
+
+// oidcAuthenticator atomically exposes the delegate produced for the latest
+// observed OIDC CA configuration. Reconciliation, rather than request traffic,
+// owns delegate initialization and replacement.
 type oidcAuthenticator struct {
 	lifecycleCtx context.Context
 	opts         oidcOptions
 
-	mu       sync.Mutex
-	delegate oidcauthenticator.AuthenticatorTokenWithHealthCheck
+	reconcileMu           sync.Mutex
+	observedConfiguration string
+	newDelegate           oidcDelegateFactory
+
+	mu                  sync.RWMutex
+	delegate            oidcauthenticator.AuthenticatorTokenWithHealthCheck
+	delegateCancel      context.CancelFunc
+	initializationError error
 }
 
-func newOIDCAuthenticator(lifecycleCtx context.Context, opts oidcOptions) *oidcAuthenticator {
-	return &oidcAuthenticator{lifecycleCtx: lifecycleCtx, opts: opts}
+func newOIDCAuthenticator(lifecycleCtx context.Context, opts oidcOptions) (*oidcAuthenticator, error) {
+	a := &oidcAuthenticator{
+		lifecycleCtx:        lifecycleCtx,
+		opts:                opts,
+		initializationError: errors.New("oidc authenticator is not initialized"),
+	}
+	a.newDelegate = a.buildDelegate
+
+	// ConfigMap-backed CA data is initialized by the informer controller after
+	// its cache has synced. Other configurations can start discovery now.
+	if opts.caConfigMap != "" {
+		return a, nil
+	}
+
+	if opts.caFile == "" {
+		if _, err := a.reconcileCABundle("system-roots", nil); err != nil {
+			return nil, err
+		}
+		return a, nil
+	}
+
+	caBundle, err := os.ReadFile(opts.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read oidc CA file: %w", err)
+	}
+	if _, err := a.reconcileCABundle(caConfigurationKey("file", caBundle), caBundle); err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 // effectiveUsernamePrefix implements the legacy kube-apiserver flag behavior:
@@ -120,6 +163,9 @@ func validateOIDCOptions(opts oidcOptions) error {
 	if opts.issuerURL == "" {
 		return nil
 	}
+	if opts.caFile != "" && opts.caConfigMap != "" {
+		return fmt.Errorf("--oidc-ca-file and --oidc-ca-configmap are mutually exclusive")
+	}
 
 	// an empty prefix matches every name and would silently reject all tokens
 	if slices.Contains(opts.reservedNamePrefixes, "") {
@@ -144,46 +190,122 @@ func validateOIDCOptions(opts oidcOptions) error {
 	return nil
 }
 
-func (a *oidcAuthenticator) getDelegate() (oidcauthenticator.AuthenticatorTokenWithHealthCheck, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.delegate != nil {
-		return a.delegate, nil
-	}
-
+func (a *oidcAuthenticator) buildDelegate(
+	lifecycleCtx context.Context,
+	caBundle []byte,
+) (oidcauthenticator.AuthenticatorTokenWithHealthCheck, func(), error) {
 	transport := utilnet.SetTransportDefaults(&http.Transport{
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 	})
-	if a.opts.caFile != "" {
-		pool, err := certutil.NewPool(a.opts.caFile)
+	if caBundle != nil {
+		pool, err := certutil.NewPoolFromBytes(caBundle)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read oidc CA file: %v", err)
+			return nil, nil, fmt.Errorf("failed to load oidc CA bundle: %w", err)
 		}
 		transport.TLSClientConfig.RootCAs = pool
 	}
 
-	delegate, err := oidcauthenticator.New(a.lifecycleCtx, oidcauthenticator.Options{
+	delegate, err := oidcauthenticator.New(lifecycleCtx, oidcauthenticator.Options{
 		Client:               &http.Client{Timeout: oidcHTTPTimeout, Transport: transport},
 		SupportedSigningAlgs: a.opts.signingAlgs,
 		JWTAuthenticator:     buildJWTAuthenticatorConfig(a.opts),
 		APIServerID:          "cluster-proxy-service-proxy",
 	})
 	if err != nil {
-		return nil, err
+		transport.CloseIdleConnections()
+		return nil, nil, err
+	}
+	return delegate, transport.CloseIdleConnections, nil
+}
+
+func caConfigurationKey(source string, caBundle []byte) string {
+	sum := sha256.Sum256(caBundle)
+	return fmt.Sprintf("%s:%x", source, sum)
+}
+
+// reconcileCABundle applies one observed CA configuration exactly once. It
+// disables the old delegate before constructing the replacement so an invalid
+// security configuration fails closed.
+func (a *oidcAuthenticator) reconcileCABundle(configurationKey string, caBundle []byte) (bool, error) {
+	a.reconcileMu.Lock()
+	defer a.reconcileMu.Unlock()
+
+	if a.observedConfiguration == configurationKey {
+		return false, nil
+	}
+	a.observedConfiguration = configurationKey
+	a.replaceDelegate(nil, nil, errors.New("oidc authenticator is initializing"))
+
+	delegateCtx, cancel := context.WithCancel(a.lifecycleCtx)
+	newDelegate := a.newDelegate
+	if newDelegate == nil {
+		newDelegate = a.buildDelegate
+	}
+	delegate, cleanup, err := newDelegate(delegateCtx, caBundle)
+	if err != nil {
+		cancel()
+		if cleanup != nil {
+			cleanup()
+		}
+		initializationError := fmt.Errorf("failed to initialize OIDC authenticator: %w", err)
+		a.replaceDelegate(nil, nil, initializationError)
+		return true, initializationError
 	}
 
+	a.replaceDelegate(delegate, func() {
+		cancel()
+		if cleanup != nil {
+			cleanup()
+		}
+	}, nil)
+	return true, nil
+}
+
+// markUnavailable records a desired configuration that cannot produce an
+// authenticator. Repeated informer events for the same state are no-ops.
+func (a *oidcAuthenticator) markUnavailable(configurationKey string, err error) bool {
+	a.reconcileMu.Lock()
+	defer a.reconcileMu.Unlock()
+
+	if a.observedConfiguration == configurationKey {
+		return false
+	}
+	a.observedConfiguration = configurationKey
+	a.replaceDelegate(nil, nil, err)
+	return true
+}
+
+func (a *oidcAuthenticator) replaceDelegate(
+	delegate oidcauthenticator.AuthenticatorTokenWithHealthCheck,
+	cancel context.CancelFunc,
+	initializationError error,
+) {
+	a.mu.Lock()
+	oldCancel := a.delegateCancel
 	a.delegate = delegate
-	return delegate, nil
+	a.delegateCancel = cancel
+	a.initializationError = initializationError
+	a.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
 }
 
 // AuthenticateToken delegates OIDC verification and claim mapping to the
 // Kubernetes authenticator, reporting provider health failures as
 // infrastructure errors and token failures as ErrTokenNotAuthenticated.
 func (a *oidcAuthenticator) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-	delegate, err := a.getDelegate()
-	if err != nil {
-		return nil, false, err
+	a.mu.RLock()
+	delegate := a.delegate
+	initializationError := a.initializationError
+	a.mu.RUnlock()
+
+	if delegate == nil {
+		if initializationError == nil {
+			initializationError = errors.New("oidc authenticator is not initialized")
+		}
+		return nil, false, initializationError
 	}
 
 	// Kubernetes stores the verifier before clearing the health error. Snapshot
