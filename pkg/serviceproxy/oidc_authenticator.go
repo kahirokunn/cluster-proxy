@@ -3,6 +3,7 @@ package serviceproxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -20,9 +21,19 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// oidcHTTPTimeout bounds every HTTP call to the OIDC issuer (discovery,
-// distributed claims, and JWKS fetches).
-const oidcHTTPTimeout = 15 * time.Second
+const (
+	// oidcHTTPTimeout bounds every HTTP call to the OIDC issuer (discovery,
+	// distributed claims, and JWKS fetches).
+	oidcHTTPTimeout = 15 * time.Second
+
+	// oidcInitializationWaitTimeout bounds how long a matching request waits for
+	// the asynchronously initialized Kubernetes OIDC authenticator.
+	oidcInitializationWaitTimeout = 30 * time.Second
+
+	oidcInitializationPollInterval = 100 * time.Millisecond
+)
+
+var errOIDCAuthenticationUnavailable = errors.New("OIDC authentication unavailable")
 
 type oidcOptions struct {
 	issuerURL            string
@@ -37,18 +48,33 @@ type oidcOptions struct {
 	reservedNamePrefixes []string
 }
 
-// oidcAuthenticator lazily creates Kubernetes' OIDC authenticator on first use,
-// so an issuer or CA file that is not ready at pod startup does not fail startup.
+// oidcAuthenticator starts Kubernetes' asynchronous OIDC initialization at
+// process startup. A missing CA file or unavailable issuer is retried without
+// failing the process, and matching requests can wait for the shared ready
+// signal instead of observing a transient authentication rejection.
 type oidcAuthenticator struct {
 	lifecycleCtx context.Context
 	opts         oidcOptions
 
 	mu       sync.Mutex
 	delegate oidcauthenticator.AuthenticatorTokenWithHealthCheck
+
+	startOnce             sync.Once
+	ready                 chan struct{}
+	stateMu               sync.RWMutex
+	lastInitializationErr error
+	waitTimeout           time.Duration
 }
 
 func newOIDCAuthenticator(lifecycleCtx context.Context, opts oidcOptions) *oidcAuthenticator {
-	return &oidcAuthenticator{lifecycleCtx: lifecycleCtx, opts: opts}
+	authn := &oidcAuthenticator{
+		lifecycleCtx: lifecycleCtx,
+		opts:         opts,
+		ready:        make(chan struct{}),
+		waitTimeout:  oidcInitializationWaitTimeout,
+	}
+	authn.start()
+	return authn
 }
 
 // effectiveUsernamePrefix implements the legacy kube-apiserver flag behavior:
@@ -177,13 +203,85 @@ func (a *oidcAuthenticator) getDelegate() (oidcauthenticator.AuthenticatorTokenW
 	return delegate, nil
 }
 
+func (a *oidcAuthenticator) start() {
+	a.startOnce.Do(func() {
+		if a.lifecycleCtx == nil {
+			a.lifecycleCtx = context.Background()
+		}
+		if a.ready == nil {
+			a.ready = make(chan struct{})
+		}
+		if a.waitTimeout <= 0 {
+			a.waitTimeout = oidcInitializationWaitTimeout
+		}
+		go a.initialize()
+	})
+}
+
+func (a *oidcAuthenticator) initialize() {
+	ticker := time.NewTicker(oidcInitializationPollInterval)
+	defer ticker.Stop()
+
+	for {
+		delegate, err := a.getDelegate()
+		if err == nil {
+			err = delegate.HealthCheck()
+		}
+		a.setLastInitializationError(err)
+		if err == nil {
+			close(a.ready)
+			return
+		}
+
+		select {
+		case <-a.lifecycleCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (a *oidcAuthenticator) setLastInitializationError(err error) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.lastInitializationErr = err
+}
+
+func (a *oidcAuthenticator) lastInitializationError() error {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.lastInitializationErr
+}
+
+func (a *oidcAuthenticator) waitUntilReady(ctx context.Context) error {
+	timer := time.NewTimer(a.waitTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-a.ready:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", errOIDCAuthenticationUnavailable, ctx.Err())
+	case <-timer.C:
+		return fmt.Errorf("%w after %v: %v", errOIDCAuthenticationUnavailable, a.waitTimeout, a.lastInitializationError())
+	}
+}
+
 // AuthenticateToken delegates OIDC verification and claim mapping to the
 // Kubernetes authenticator, reporting provider health failures as
 // infrastructure errors and token failures as ErrTokenNotAuthenticated.
 func (a *oidcAuthenticator) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	a.start()
+
 	delegate, err := a.getDelegate()
 	if err != nil {
-		return nil, false, err
+		if waitErr := a.waitUntilReady(ctx); waitErr != nil {
+			return nil, false, waitErr
+		}
+		delegate, err = a.getDelegate()
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", errOIDCAuthenticationUnavailable, err)
+		}
 	}
 
 	// Kubernetes stores the verifier before clearing the health error. Snapshot
@@ -195,7 +293,17 @@ func (a *oidcAuthenticator) AuthenticateToken(ctx context.Context, token string)
 		return resp, authenticated, nil
 	}
 	if healthErr != nil {
-		return nil, false, healthErr
+		if waitErr := a.waitUntilReady(ctx); waitErr != nil {
+			return nil, false, waitErr
+		}
+
+		resp, authenticated, err = delegate.AuthenticateToken(ctx, token)
+		if err == nil {
+			return resp, authenticated, nil
+		}
+		if healthErr = delegate.HealthCheck(); healthErr != nil {
+			return nil, false, fmt.Errorf("%w: %v", errOIDCAuthenticationUnavailable, healthErr)
+		}
 	}
 	return nil, false, fmt.Errorf("%v: %w", err, ErrTokenNotAuthenticated)
 }

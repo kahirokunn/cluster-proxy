@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
+	oidcauthenticator "k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 )
 
 // rejectTokenReview rejects every token, so requests fall through to the OIDC
@@ -42,9 +44,11 @@ type fakeIssuer struct {
 	caFile         string
 	discoveryTried atomic.Bool
 	failDiscovery  atomic.Bool
+	discoveryGate  chan struct{}
 }
 
 type fakeOIDCDelegate struct {
+	mu                sync.RWMutex
 	healthErr         error
 	authenticateToken func(context.Context, string) (*authenticator.Response, bool, error)
 }
@@ -54,7 +58,28 @@ func (f *fakeOIDCDelegate) AuthenticateToken(ctx context.Context, token string) 
 }
 
 func (f *fakeOIDCDelegate) HealthCheck() error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.healthErr
+}
+
+func (f *fakeOIDCDelegate) setHealthError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healthErr = err
+}
+
+func newFakeOIDCAuthenticator(t *testing.T, delegate oidcauthenticator.AuthenticatorTokenWithHealthCheck, waitTimeout time.Duration) *oidcAuthenticator {
+	t.Helper()
+
+	authn := &oidcAuthenticator{
+		lifecycleCtx: t.Context(),
+		delegate:     delegate,
+		ready:        make(chan struct{}),
+		waitTimeout:  waitTimeout,
+	}
+	authn.start()
+	return authn
 }
 
 func newFakeIssuer(t *testing.T) *fakeIssuer {
@@ -77,6 +102,13 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/.well-known/openid-configuration" {
 			f.discoveryTried.Store(true)
+			if f.discoveryGate != nil {
+				select {
+				case <-f.discoveryGate:
+				case <-r.Context().Done():
+					return
+				}
+			}
 			if f.failDiscovery.Load() {
 				http.Error(w, "discovery unavailable", http.StatusInternalServerError)
 				return
@@ -295,7 +327,9 @@ func TestOIDCAuthenticator_ClaimMapping(t *testing.T) {
 			authn := newOIDCAuthenticator(t.Context(), opts)
 
 			token := issuer.signToken(t, issuer.claims(tt.claims))
-			resp, ok, err := authenticateUntilSettled(t, authn, token, 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			resp, ok, err := authn.AuthenticateToken(ctx, token)
 			if tt.wantRejected {
 				if ok {
 					t.Fatal("expected authenticated=false")
@@ -323,24 +357,28 @@ func TestOIDCAuthenticator_ClaimMapping(t *testing.T) {
 }
 
 func TestOIDCAuthenticator_HealthSnapshot(t *testing.T) {
-	t.Run("startup failure remains an infrastructure error when initialization completes during authentication", func(t *testing.T) {
+	t.Run("initialization completing during authentication retries the request", func(t *testing.T) {
 		startupErr := errors.New("authenticator not initialized")
 		delegate := &fakeOIDCDelegate{healthErr: startupErr}
+		var attempts atomic.Int32
 		delegate.authenticateToken = func(context.Context, string) (*authenticator.Response, bool, error) {
-			delegate.healthErr = nil
-			return nil, false, errors.New("oidc: authenticator not initialized")
+			if attempts.Add(1) == 1 {
+				delegate.setHealthError(nil)
+				return nil, false, errors.New("oidc: authenticator not initialized")
+			}
+			return &authenticator.Response{User: &user.DefaultInfo{Name: "oidc:alice"}}, true, nil
 		}
-		authn := &oidcAuthenticator{delegate: delegate}
+		authn := newFakeOIDCAuthenticator(t, delegate, time.Second)
 
 		resp, ok, err := authn.AuthenticateToken(t.Context(), "token")
-		if !errors.Is(err, startupErr) {
-			t.Fatalf("expected startup error, got: %v", err)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if errors.Is(err, ErrTokenNotAuthenticated) {
-			t.Fatalf("startup error must not be classified as a token rejection: %v", err)
+		if !ok || resp == nil || resp.User.GetName() != "oidc:alice" {
+			t.Fatalf("expected successful retry, got ok=%v resp=%v", ok, resp)
 		}
-		if ok || resp != nil {
-			t.Fatalf("expected unauthenticated nil response, got ok=%v resp=%v", ok, resp)
+		if got := attempts.Load(); got != 2 {
+			t.Fatalf("authentication attempts=%d, want 2", got)
 		}
 	})
 
@@ -350,7 +388,7 @@ func TestOIDCAuthenticator_HealthSnapshot(t *testing.T) {
 				return nil, false, errors.New("invalid signature")
 			},
 		}
-		authn := &oidcAuthenticator{delegate: delegate}
+		authn := newFakeOIDCAuthenticator(t, delegate, time.Second)
 
 		resp, ok, err := authn.AuthenticateToken(t.Context(), "token")
 		if !errors.Is(err, ErrTokenNotAuthenticated) {
@@ -368,7 +406,7 @@ func TestOIDCAuthenticator_HealthSnapshot(t *testing.T) {
 				return nil, false, nil
 			},
 		}
-		authn := &oidcAuthenticator{delegate: delegate}
+		authn := newFakeOIDCAuthenticator(t, delegate, time.Second)
 
 		resp, ok, err := authn.AuthenticateToken(t.Context(), "foreign-token")
 		if err != nil {
@@ -378,6 +416,59 @@ func TestOIDCAuthenticator_HealthSnapshot(t *testing.T) {
 			t.Fatalf("expected unauthenticated nil response, got ok=%v resp=%v", ok, resp)
 		}
 	})
+}
+
+func TestOIDCAuthenticator_PrewarmBeforeFirstRequest(t *testing.T) {
+	issuer := newFakeIssuer(t)
+	_ = newOIDCAuthenticator(t.Context(), issuer.defaultOpts())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !issuer.discoveryTried.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("OIDC discovery did not start before the first authentication request")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestOIDCAuthenticator_ConcurrentColdStart(t *testing.T) {
+	issuer := newFakeIssuer(t)
+	issuer.discoveryGate = make(chan struct{})
+	authn := newOIDCAuthenticator(t.Context(), issuer.defaultOpts())
+	authn.waitTimeout = 5 * time.Second
+	token := issuer.signToken(t, issuer.claims(nil))
+
+	const requests = 25
+	results := make(chan error, requests)
+	for range requests {
+		go func() {
+			resp, ok, err := authn.AuthenticateToken(t.Context(), token)
+			if err != nil {
+				results <- err
+				return
+			}
+			if !ok || resp == nil {
+				results <- fmt.Errorf("unexpected authentication result: ok=%v resp=%v", ok, resp)
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !issuer.discoveryTried.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("OIDC discovery did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(issuer.discoveryGate)
+
+	for range requests {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestOIDCAuthenticator_MalformedToken(t *testing.T) {
@@ -419,12 +510,16 @@ func TestOIDCAuthenticator_IssuerUnreachable(t *testing.T) {
 	issuer.server.Close()
 
 	authn := newOIDCAuthenticator(t.Context(), issuer.defaultOpts())
+	authn.waitTimeout = 100 * time.Millisecond
 	resp, ok, err := authn.AuthenticateToken(context.Background(), token)
 	if err == nil {
 		t.Fatal("expected error when issuer is unreachable")
 	}
 	if errors.Is(err, ErrTokenNotAuthenticated) {
 		t.Fatal("issuer unreachable should NOT be wrapped with ErrTokenNotAuthenticated")
+	}
+	if !errors.Is(err, errOIDCAuthenticationUnavailable) {
+		t.Fatalf("expected OIDC availability error, got: %v", err)
 	}
 	if ok {
 		t.Fatal("expected authenticated=false")
@@ -436,17 +531,21 @@ func TestOIDCAuthenticator_IssuerUnreachable(t *testing.T) {
 
 func TestOIDCAuthenticator_DiscoveryRetry(t *testing.T) {
 	issuer := newFakeIssuer(t)
+	issuer.failDiscovery.Store(true)
 	authn := newOIDCAuthenticator(t.Context(), issuer.defaultOpts())
+	authn.waitTimeout = 100 * time.Millisecond
 	token := issuer.signToken(t, issuer.claims(nil))
 
 	// first request fails discovery -> infrastructure error, not cached
-	issuer.failDiscovery.Store(true)
 	_, ok, err := authn.AuthenticateToken(context.Background(), token)
 	if err == nil || ok {
 		t.Fatalf("expected discovery failure, got ok=%v err=%v", ok, err)
 	}
 	if errors.Is(err, ErrTokenNotAuthenticated) {
 		t.Fatal("discovery failure should NOT be wrapped with ErrTokenNotAuthenticated")
+	}
+	if !errors.Is(err, errOIDCAuthenticationUnavailable) {
+		t.Fatalf("expected OIDC availability error, got: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for !issuer.discoveryTried.Load() {
@@ -487,6 +586,7 @@ func TestOIDCAuthenticator_CAFileMissing(t *testing.T) {
 	opts := issuer.defaultOpts()
 	opts.caFile = caFile
 	authn := newOIDCAuthenticator(t.Context(), opts)
+	authn.waitTimeout = 100 * time.Millisecond
 
 	_, ok, err := authn.AuthenticateToken(context.Background(), token)
 	if err == nil || ok {
@@ -494,6 +594,9 @@ func TestOIDCAuthenticator_CAFileMissing(t *testing.T) {
 	}
 	if errors.Is(err, ErrTokenNotAuthenticated) {
 		t.Fatal("missing CA file should NOT be wrapped with ErrTokenNotAuthenticated")
+	}
+	if !errors.Is(err, errOIDCAuthenticationUnavailable) {
+		t.Fatalf("expected OIDC availability error, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "failed to read oidc CA file") {
 		t.Fatalf("expected CA file read error, got: %v", err)
@@ -610,7 +713,7 @@ func TestProcessAuthentication_OIDCInfraError(t *testing.T) {
 		managedClusterAuthenticator: rejectTokenReview,
 		hubAuthenticator:            rejectTokenReview,
 		oidcAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-			return nil, false, errors.New("issuer unreachable")
+			return nil, false, fmt.Errorf("%w: issuer unreachable", errOIDCAuthenticationUnavailable)
 		}),
 	}
 
@@ -627,6 +730,36 @@ func TestProcessAuthentication_OIDCInfraError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "issuer unreachable") {
 		t.Fatalf("expected original error message preserved, got: %v", err)
+	}
+	if !errors.Is(err, errOIDCAuthenticationUnavailable) {
+		t.Fatalf("expected OIDC availability error, got: %v", err)
+	}
+}
+
+func TestServeHTTP_OIDCUnavailable(t *testing.T) {
+	s := &serviceProxy{
+		enableImpersonation:         true,
+		managedClusterAuthenticator: rejectTokenReview,
+		hubAuthenticator:            rejectTokenReview,
+		oidcAuthenticator: authenticator.TokenFunc(func(context.Context, string) (*authenticator.Response, bool, error) {
+			return nil, false, fmt.Errorf("%w: issuer unreachable", errOIDCAuthenticationUnavailable)
+		}),
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://service-proxy.example/api", nil)
+	req.Header.Set("Authorization", "Bearer oidc-token")
+	req.Header.Set("Cluster-Proxy-Proto", "https")
+	req.Header.Set("Cluster-Proxy-Namespace", "default")
+	req.Header.Set("Cluster-Proxy-Service", "kubernetes")
+	req.Header.Set("Cluster-Proxy-Port", "443")
+	recorder := httptest.NewRecorder()
+
+	s.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: got %d, want 503: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Body.String() != "authentication service unavailable\n" {
+		t.Fatalf("unexpected response body: %q", recorder.Body.String())
 	}
 }
 

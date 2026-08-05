@@ -336,7 +336,7 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		if s.enableImpersonation {
 			if err := s.processAuthentication(ctx, req); err != nil {
 				logger.Error(err, "authentication failed")
-				http.Error(wr, err.Error(), http.StatusUnauthorized)
+				writeAuthenticationError(wr, err)
 				return
 			}
 		}
@@ -356,6 +356,15 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	proxy := httputil.NewSingleHostReverseProxy(url)
 	proxy.Transport = s.proxyTransport
 	proxy.ServeHTTP(wr, req)
+}
+
+func writeAuthenticationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errOIDCAuthenticationUnavailable) {
+		http.Error(w, "authentication service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	http.Error(w, err.Error(), http.StatusUnauthorized)
 }
 
 func (s *serviceProxy) newProxyTransport() *http.Transport {
@@ -492,7 +501,7 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 					oidcAuthenticated = false
 				} else {
 					logger.Error(err, "oidc authentication failed")
-					return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, hub cluster auth: not authenticated, oidc auth error: %v", err)
+					return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, hub cluster auth: not authenticated, oidc auth error: %w", err)
 				}
 			}
 			logger.V(4).Info("oidc authentication result",

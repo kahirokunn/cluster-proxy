@@ -136,13 +136,19 @@ var _ = Describe("OIDC Authentication Test", Label("serviceproxy", "oidc"), Orde
 	})
 
 	It("should report the impersonated OIDC identity", func() {
-		// the first request also triggers the service-proxy's lazy OIDC
-		// provider discovery, hence the Eventually
 		Eventually(func() error {
 			review, err := oidcProxyClient.AuthenticationV1().SelfSubjectReviews().Create(
 				context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+			if apierrors.IsUnauthorized(err) {
+				return StopTrying("OIDC authentication must not reject the first request while initializing").Wrap(err)
+			}
 			if err != nil {
-				return err
+				// main can briefly route to a terminating proxy-agent after a
+				// rollout. Retry only that independent, pre-existing failure.
+				if strings.Contains(err.Error(), "dial tcp 127.0.0.1:7443: connect: connection refused") {
+					return err
+				}
+				return StopTrying("unexpected OIDC proxy error").Wrap(err)
 			}
 			if review.Status.UserInfo.Username != expectedOIDCUsername {
 				return fmt.Errorf("expected username %q, got %q", expectedOIDCUsername, review.Status.UserInfo.Username)
@@ -151,7 +157,7 @@ var _ = Describe("OIDC Authentication Test", Label("serviceproxy", "oidc"), Orde
 				return fmt.Errorf("expected system:authenticated in groups %v", review.Status.UserInfo.Groups)
 			}
 			return nil
-		}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+		}).WithTimeout(time.Minute).WithPolling(time.Second).Should(Succeed())
 	})
 
 	It("should be forbidden without RBAC", func() {

@@ -442,9 +442,11 @@ Important security behavior:
   `true`.
 - Configure `oidcGroupsPrefix` when external group names could collide with
   existing managed cluster RBAC subjects.
-- Issuer discovery and JWKS initialization are lazy. An unavailable issuer
-  does not crash-loop service-proxy or affect TokenReview authentication; OIDC
-  requests fail until the issuer is available.
+- Issuer discovery and JWKS initialization start when service-proxy starts. An
+  unavailable issuer does not crash-loop service-proxy or delay TokenReview
+  authentication. A matching OIDC request waits up to 30 seconds for
+  initialization and receives `503 Service Unavailable` if the provider is
+  still unavailable; rejected credentials receive `401 Unauthorized`.
 
 ### Configure OIDC for one managed cluster
 
@@ -602,10 +604,11 @@ publicly trusted certificate, or replace it with
 
 The `oidcCAConfigMap` volume is optional so the Pod can start before the
 ConfigMap exists. When the value is configured, a valid `ca.crt` must be
-available before an OIDC request can initialize the authenticator. If the
-first request arrives too early, it fails without affecting the TokenReview
-paths; a later request can initialize successfully after the ConfigMap is
-created. No Pod restart is required.
+available before the authenticator can initialize. service-proxy retries the
+CA file and issuer discovery in the background. OIDC requests wait up to 30
+seconds for initialization and return `503 Service Unavailable` on timeout,
+without affecting the TokenReview paths. Requests succeed after the ConfigMap
+or issuer becomes available; no Pod restart is required.
 
 ### Automated coverage
 
