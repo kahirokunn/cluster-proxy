@@ -3,7 +3,9 @@ kind: ClusterRole
 metadata:
   name: cluster-proxy-addon-agent-impersonator
 rules:
-{{- if eq .Values.enableImpersonation "true" }}
+{{- $enableHubTokenAuthentication := eq (include "cluster-proxy-common.hubTokenAuthenticationEnabled" .) "true" }}
+{{- $enableOIDCAuthentication := eq (include "cluster-proxy-addon.oidcAuthenticationEnabled" .) "true" }}
+{{- if or $enableHubTokenAuthentication $enableOIDCAuthentication }}
 - apiGroups: [""]
   resources: ["users", "groups"]
   verbs: ["impersonate"]

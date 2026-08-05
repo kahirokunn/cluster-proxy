@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -78,7 +79,7 @@ func TestTokenReviewAuthenticator_Unauthenticated(t *testing.T) {
 
 func TestProcessAuthentication_ManagedClusterToken(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return &authenticator.Response{User: &user.DefaultInfo{Name: "mc-user"}}, true, nil
 		}),
@@ -192,32 +193,30 @@ func (t *requestCapturingRoundTripper) CloseIdleConnections() {}
 
 func TestServeHTTPAuthenticationRouting(t *testing.T) {
 	tests := []struct {
-		name                       string
-		enableImpersonation        bool
-		clientImpersonationHeaders bool
-		wantAuthenticationCalls    int
+		name                         string
+		enableHubTokenAuthentication bool
+		clientImpersonationHeaders   bool
+		wantAuthenticationCalls      int
 	}{
 		{
 			name:                    "disabled without client impersonation headers",
-			enableImpersonation:     false,
 			wantAuthenticationCalls: 0,
 		},
 		{
 			name:                       "disabled with client impersonation headers",
-			enableImpersonation:        false,
 			clientImpersonationHeaders: true,
 			wantAuthenticationCalls:    0,
 		},
 		{
-			name:                       "enabled with client impersonation headers",
-			enableImpersonation:        true,
-			clientImpersonationHeaders: true,
-			wantAuthenticationCalls:    0,
+			name:                         "hub authentication enabled with client impersonation headers",
+			enableHubTokenAuthentication: true,
+			clientImpersonationHeaders:   true,
+			wantAuthenticationCalls:      0,
 		},
 		{
-			name:                    "enabled without client impersonation headers",
-			enableImpersonation:     true,
-			wantAuthenticationCalls: 1,
+			name:                         "hub authentication enabled without client impersonation headers",
+			enableHubTokenAuthentication: true,
+			wantAuthenticationCalls:      1,
 		},
 	}
 
@@ -226,7 +225,7 @@ func TestServeHTTPAuthenticationRouting(t *testing.T) {
 			authenticationCalls := 0
 			transport := &requestCapturingRoundTripper{}
 			s := &serviceProxy{
-				enableImpersonation: tt.enableImpersonation,
+				enableHubTokenAuthentication: tt.enableHubTokenAuthentication,
 				managedClusterAuthenticator: authenticator.TokenFunc(
 					func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 						authenticationCalls++
@@ -236,12 +235,6 @@ func TestServeHTTPAuthenticationRouting(t *testing.T) {
 				hubAuthenticator: authenticator.TokenFunc(
 					func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 						t.Fatal("hub authenticator should not be called")
-						return nil, false, nil
-					},
-				),
-				oidcAuthenticator: authenticator.TokenFunc(
-					func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-						t.Fatal("OIDC authenticator should not be called")
 						return nil, false, nil
 					},
 				),
@@ -294,7 +287,7 @@ func TestServeHTTPAuthenticationRouting(t *testing.T) {
 
 func TestProcessAuthentication_HubServiceAccountToken(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, nil // not a managed cluster token
 		}),
@@ -333,7 +326,7 @@ func TestProcessAuthentication_HubServiceAccountToken(t *testing.T) {
 
 func TestProcessAuthentication_UnauthenticatedToken(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, nil
 		}),
@@ -561,7 +554,7 @@ func TestTokenReviewAuthenticator_StatusError_UnknownError(t *testing.T) {
 
 func TestProcessAuthentication_GetImpersonateTokenError(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, nil
 		}),
@@ -593,7 +586,7 @@ func TestProcessAuthentication_GetImpersonateTokenError(t *testing.T) {
 
 func TestProcessAuthentication_ManagedClusterFatalError(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, fmt.Errorf("apiserver unreachable")
 		}),
@@ -618,7 +611,7 @@ func TestProcessAuthentication_ManagedClusterFatalError(t *testing.T) {
 
 func TestProcessAuthentication_OpenShiftTokenReviewError_FallsBackToHub(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, fmt.Errorf(
 				"managed cluster TokenReview: invalid bearer token, token lookup failed: %w",
@@ -656,7 +649,7 @@ func TestProcessAuthentication_OpenShiftTokenReviewError_FallsBackToHub(t *testi
 
 func TestProcessAuthentication_HubAuthError(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation: true,
+		enableHubTokenAuthentication: true,
 		managedClusterAuthenticator: authenticator.TokenFunc(
 			func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 				return nil, false, nil // not a managed cluster token
@@ -704,5 +697,46 @@ func TestProcessHubUser_IgnoresClientInjectedGroups(t *testing.T) {
 	groups := req.Header.Values(authenticationv1.ImpersonateGroupHeader)
 	if len(groups) != 1 || groups[0] != "system:authenticated" {
 		t.Fatalf("expected only authenticated group after processHubUser, got %v", groups)
+	}
+}
+
+func TestHubTokenAuthenticationFlagCompatibility(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected bool
+	}{
+		{name: "default", expected: true},
+		{name: "--enable-hub-token-authentication", args: []string{"--enable-hub-token-authentication=false"}},
+		{name: "--enable-impersonation", args: []string{"--enable-impersonation=false"}},
+		{
+			name:     "--enable-hub-token-authentication takes precedence when specified first",
+			args:     []string{"--enable-hub-token-authentication=true", "--enable-impersonation=false"},
+			expected: true,
+		},
+		{
+			name: "--enable-hub-token-authentication takes precedence when specified last",
+			args: []string{"--enable-impersonation=true", "--enable-hub-token-authentication=false"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newServiceProxy()
+			cmd := &cobra.Command{}
+			s.AddFlags(cmd)
+
+			if err := cmd.ParseFlags(tt.args); err != nil {
+				t.Fatalf("unexpected flag parsing error: %v", err)
+			}
+			s.resolveHubTokenAuthenticationFlags(cmd)
+
+			if s.enableHubTokenAuthentication != tt.expected {
+				t.Fatalf("enableHubTokenAuthentication = %t, want %t", s.enableHubTokenAuthentication, tt.expected)
+			}
+			if deprecated := cmd.Flags().Lookup("enable-impersonation").Deprecated; deprecated == "" {
+				t.Fatal("expected --enable-impersonation to be marked deprecated")
+			}
+		})
 	}
 }

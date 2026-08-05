@@ -513,9 +513,7 @@ func TestOIDCAuthenticator_CAFileMissing(t *testing.T) {
 
 func TestProcessAuthentication_OIDCToken(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation:         true,
 		managedClusterAuthenticator: rejectTokenReview,
-		hubAuthenticator:            rejectTokenReview,
 		oidcAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return &authenticator.Response{
 				User: &user.DefaultInfo{
@@ -552,9 +550,7 @@ func TestProcessAuthentication_OIDCToken(t *testing.T) {
 
 func TestProcessAuthentication_OIDCTokenAlreadyAuthenticatedGroup(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation:         true,
 		managedClusterAuthenticator: rejectTokenReview,
-		hubAuthenticator:            rejectTokenReview,
 		oidcAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return &authenticator.Response{
 				User: &user.DefaultInfo{
@@ -583,9 +579,7 @@ func TestProcessAuthentication_OIDCTokenAlreadyAuthenticatedGroup(t *testing.T) 
 
 func TestProcessAuthentication_OIDCTokenRejected(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation:         true,
 		managedClusterAuthenticator: rejectTokenReview,
-		hubAuthenticator:            rejectTokenReview,
 		oidcAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, fmt.Errorf("token expired: %w", ErrTokenNotAuthenticated)
 		}),
@@ -599,16 +593,14 @@ func TestProcessAuthentication_OIDCTokenRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected authentication error")
 	}
-	if !strings.Contains(err.Error(), "not valid for managed cluster, hub cluster, or the configured OIDC issuer") {
+	if !strings.Contains(err.Error(), "neither valid for managed cluster nor the configured OIDC issuer") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestProcessAuthentication_OIDCInfraError(t *testing.T) {
 	s := &serviceProxy{
-		enableImpersonation:         true,
 		managedClusterAuthenticator: rejectTokenReview,
-		hubAuthenticator:            rejectTokenReview,
 		oidcAuthenticator: authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
 			return nil, false, errors.New("issuer unreachable")
 		}),
@@ -632,10 +624,9 @@ func TestProcessAuthentication_OIDCInfraError(t *testing.T) {
 
 func TestValidate_OIDCFlags(t *testing.T) {
 	tests := []struct {
-		name            string
-		oidc            oidcOptions
-		noImpersonation bool
-		wantErr         string
+		name    string
+		oidc    oidcOptions
+		wantErr string
 	}{
 		{
 			name: "oidc disabled",
@@ -663,12 +654,6 @@ func TestValidate_OIDCFlags(t *testing.T) {
 				signingAlgs:   []string{oidc.RS256},
 			},
 			wantErr: "URL scheme must be https",
-		},
-		{
-			name:            "issuer without impersonation",
-			oidc:            oidcOptions{issuerURL: "https://dex.example.com/dex", clientID: "cluster-proxy"},
-			noImpersonation: true,
-			wantErr:         "--oidc-issuer-url requires --enable-impersonation=true",
 		},
 		{
 			name:    "client id without issuer",
@@ -715,7 +700,7 @@ func TestValidate_OIDCFlags(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &serviceProxy{cert: "tls.crt", key: "tls.key", enableImpersonation: !tt.noImpersonation, oidc: tt.oidc}
+			s := &serviceProxy{cert: "tls.crt", key: "tls.key", oidc: tt.oidc}
 
 			err := s.validate()
 			if tt.wantErr == "" {

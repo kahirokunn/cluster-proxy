@@ -26,8 +26,12 @@
     "clusterName": {
       "type": "string"
     },
+    "enableHubTokenAuthentication": {
+      "description": "Authenticate hub tokens and impersonate their identities on the managed cluster. Empty inherits enableImpersonation.",
+      "type": "string"
+    },
     "enableImpersonation": {
-      "description": "Enable service-proxy impersonation for hub and external OIDC identities.",
+      "description": "Deprecated alias for enableHubTokenAuthentication.",
       "type": "string"
     },
     "global": {

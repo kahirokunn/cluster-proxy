@@ -41,6 +41,7 @@ func NewServiceProxyCommand() *cobra.Command {
 		Short: "service-proxy",
 		Long:  `A http proxy server, receives http requests from proxy-agent and forwards to the target service.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			serviceProxyServer.resolveHubTokenAuthenticationFlags(cmd)
 			return serviceProxyServer.Run(cmd.Context())
 		},
 	}
@@ -83,7 +84,8 @@ type serviceProxy struct {
 	hubKubeClient            kubernetes.Interface
 	managedClusterKubeClient kubernetes.Interface
 
-	enableImpersonation bool
+	enableHubTokenAuthentication  bool
+	deprecatedEnableImpersonation bool
 
 	oidc oidcOptions
 
@@ -106,9 +108,11 @@ type closeIdleRoundTripper interface {
 
 func newServiceProxy() *serviceProxy {
 	s := &serviceProxy{
-		tokenReviewCacheTTL: defaultTokenReviewCacheTTL,
-		kubeClientQPS:       defaultKubeClientQPS,
-		kubeClientBurst:     defaultKubeClientBurst,
+		tokenReviewCacheTTL:           defaultTokenReviewCacheTTL,
+		kubeClientQPS:                 defaultKubeClientQPS,
+		kubeClientBurst:               defaultKubeClientBurst,
+		enableHubTokenAuthentication:  true,
+		deprecatedEnableImpersonation: true,
 	}
 	s.getImpersonateTokenFunc = s.readImpersonateTokenFromFile
 	return s
@@ -129,13 +133,19 @@ func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
 	flags.DurationVar(&s.idleConnTimeout, "idle-conn-timeout", 90*time.Second, "The maximum amount of time an idle (keep-alive) connection will remain idle before closing itself.")
 	flags.DurationVar(&s.tLSHandshakeTimeout, "tls-handshake-timeout", 10*time.Second, "The maximum amount of time waiting to wait for a TLS handshake.")
 	flags.DurationVar(&s.expectContinueTimeout, "expect-continue-timeout", 1*time.Second, "The amount of time to wait for a server's first response headers after fully writing the request headers if the request has an \"Expect: 100-continue\" header.")
-	flags.BoolVar(&s.enableImpersonation, "enable-impersonation", true, "Whether to enable impersonation")
+	flags.BoolVar(&s.enableHubTokenAuthentication, "enable-hub-token-authentication", s.enableHubTokenAuthentication,
+		"Authenticate hub tokens with the hub cluster and impersonate the resulting identity on the managed cluster")
+	flags.BoolVar(&s.deprecatedEnableImpersonation, "enable-impersonation", s.deprecatedEnableImpersonation,
+		"Deprecated alias for --enable-hub-token-authentication")
+	if err := flags.MarkDeprecated("enable-impersonation", "use --enable-hub-token-authentication instead"); err != nil {
+		panic(err)
+	}
 
 	// token review cache flags
 	flags.DurationVar(&s.tokenReviewCacheTTL, "token-review-cache-ttl", defaultTokenReviewCacheTTL, "TTL for cached TokenReview results. Set to 0 to disable caching.")
 
 	// oidc authentication flags
-	flags.StringVar(&s.oidc.issuerURL, "oidc-issuer-url", "", "The URL of the OIDC issuer, only the https scheme is accepted. Setting this enables OIDC token authentication as a fallback after the managed cluster and hub TokenReviews.")
+	flags.StringVar(&s.oidc.issuerURL, "oidc-issuer-url", "", "The URL of the OIDC issuer, only the https scheme is accepted. Setting this enables OIDC token authentication after the managed cluster TokenReview and, when enabled, the hub TokenReview.")
 	flags.StringVar(&s.oidc.clientID, "oidc-client-id", "", "The client ID that OIDC ID tokens must be issued for. Must be set together with --oidc-issuer-url.")
 	flags.StringVar(&s.oidc.usernameClaim, "oidc-username-claim", "sub", "The OIDC claim to use as the username.")
 	flags.StringVar(&s.oidc.usernamePrefix, "oidc-username-prefix", "", "The prefix prepended to username claims. If unset, non-email claims use '<issuer-url>#'; use '-' to disable prefixing.")
@@ -151,22 +161,35 @@ func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
 	flags.IntVar(&s.kubeClientBurst, "kube-api-burst", defaultKubeClientBurst, "Burst for kube API clients (managed cluster and hub).")
 }
 
+// resolveHubTokenAuthenticationFlags applies --enable-impersonation only when
+// --enable-hub-token-authentication was not explicitly set. This makes
+// --enable-hub-token-authentication take precedence whenever both flags are
+// provided, regardless of argument order.
+func (s *serviceProxy) resolveHubTokenAuthenticationFlags(cmd *cobra.Command) {
+	if !cmd.Flags().Changed("enable-hub-token-authentication") && cmd.Flags().Changed("enable-impersonation") {
+		s.enableHubTokenAuthentication = s.deprecatedEnableImpersonation
+	}
+}
+
 func (s *serviceProxy) Run(ctx context.Context) error {
 	const (
 		rootCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	)
+	if err := s.validate(); err != nil {
+		return err
+	}
+
 	var err error
 	customChecks := []healthz.Checker{}
-
-	cc, err := addonutils.NewConfigChecker("cert", s.cert, s.key, rootCAFile, s.hubKubeConfig)
+	configFiles := []string{s.cert, s.key, rootCAFile}
+	if s.enableHubTokenAuthentication {
+		configFiles = append(configFiles, s.hubKubeConfig)
+	}
+	cc, err := addonutils.NewConfigChecker("cert", configFiles...)
 	if err != nil {
 		return err
 	}
 	customChecks = append(customChecks, cc.Check)
-
-	if err := s.validate(); err != nil {
-		return err
-	}
 
 	// get root CAs
 	s.rootCAs = x509.NewCertPool()
@@ -216,40 +239,34 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		return err
 	}
 
-	// get hubKubeConfig
-	hubConfig, err := clientcmd.BuildConfigFromFlags("", s.hubKubeConfig)
-	if err != nil {
-		return err
-	}
-	hubConfig.QPS = s.kubeClientQPS
-	hubConfig.Burst = s.kubeClientBurst
-	s.hubKubeClient, err = kubernetes.NewForConfig(hubConfig)
-	if err != nil {
-		return err
-	}
+	if s.proxyAuthenticationEnabled() {
+		// initialize token authenticators with caching. The official k8s.io/apiserver
+		// token cache provides singleflight, a striped cache, and HMAC-SHA256 cache keys.
+		s.managedClusterAuthenticator = s.cacheTokenAuthenticator(
+			&tokenReviewAuthenticator{client: s.managedClusterKubeClient, name: "managed cluster"},
+		)
 
-	// initialize token authenticators with caching
-	// The official k8s.io/apiserver token cache provides:
-	// - singleflight: concurrent requests for the same token share one API call
-	// - striped cache: high-concurrency cache with minimal lock contention
-	// - HMAC-SHA256 key derivation: tokens are never stored in plaintext
-	managedClusterAuthn := &tokenReviewAuthenticator{client: s.managedClusterKubeClient, name: "managed cluster"}
-	hubAuthn := &tokenReviewAuthenticator{client: s.hubKubeClient, name: "hub"}
+		if s.enableHubTokenAuthentication {
+			hubConfig, err := clientcmd.BuildConfigFromFlags("", s.hubKubeConfig)
+			if err != nil {
+				return err
+			}
+			hubConfig.QPS = s.kubeClientQPS
+			hubConfig.Burst = s.kubeClientBurst
+			s.hubKubeClient, err = kubernetes.NewForConfig(hubConfig)
+			if err != nil {
+				return err
+			}
+			s.hubAuthenticator = s.cacheTokenAuthenticator(
+				&tokenReviewAuthenticator{client: s.hubKubeClient, name: "hub"},
+			)
+		}
 
-	if s.tokenReviewCacheTTL > 0 {
-		// cacheErrs=false: don't cache API errors (network issues, etc.)
-		// failureTTL=successTTL: cache unauthenticated results too, matching kube-apiserver
-		// best practice (see k8s.io/apiserver/pkg/authentication/authenticatorfactory/delegating.go).
-		// This is critical for impersonation mode where hub tokens always fail managed cluster
-		// auth — without failure caching, each singleflight group completion triggers a new
-		// API call, causing latency spikes under high concurrency.
-		s.managedClusterAuthenticator = cache.New(managedClusterAuthn, false, s.tokenReviewCacheTTL, s.tokenReviewCacheTTL)
-		s.hubAuthenticator = cache.New(hubAuthn, false, s.tokenReviewCacheTTL, s.tokenReviewCacheTTL)
-		klog.Infof("TokenReview cache enabled with TTL %v", s.tokenReviewCacheTTL)
-	} else {
-		s.managedClusterAuthenticator = managedClusterAuthn
-		s.hubAuthenticator = hubAuthn
-		klog.Infof("TokenReview cache disabled")
+		if s.tokenReviewCacheTTL > 0 {
+			klog.Infof("TokenReview cache enabled with TTL %v", s.tokenReviewCacheTTL)
+		} else {
+			klog.Infof("TokenReview cache disabled")
+		}
 	}
 
 	// initialize the OIDC authenticator when configured; it is not wrapped in
@@ -297,6 +314,21 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	return httpserver.ListenAndServeTLS(s.cert, s.key)
 }
 
+func (s *serviceProxy) cacheTokenAuthenticator(delegate authenticator.Token) authenticator.Token {
+	if s.tokenReviewCacheTTL <= 0 {
+		return delegate
+	}
+
+	// cacheErrs=false avoids caching infrastructure failures. Caching both
+	// successful and unauthenticated results prevents repeated fallback
+	// TokenReviews during bursts of requests for the same token.
+	return cache.New(delegate, false, s.tokenReviewCacheTTL, s.tokenReviewCacheTTL)
+}
+
+func (s *serviceProxy) proxyAuthenticationEnabled() bool {
+	return s.enableHubTokenAuthentication || s.oidc.issuerURL != "" || s.oidcAuthenticator != nil
+}
+
 func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := klog.FromContext(ctx)
@@ -328,7 +360,8 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	logger.V(4).Info("service proxy received request",
 		"targetScheme", url.Scheme,
-		"enableImpersonation", s.enableImpersonation,
+		"enableHubTokenAuthentication", s.enableHubTokenAuthentication,
+		"enableOIDCAuthentication", s.oidcAuthenticator != nil,
 		"isKubeAPIServer", url.Host == utils.KubeAPIServerHost,
 	)
 
@@ -336,7 +369,7 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		clientImpersonationRequested := hasClientImpersonationHeaders(req.Header)
 		// Delegate client impersonation unchanged to the target API server, which authenticates
 		// the original token and authorizes the requested impersonation through its own RBAC.
-		if s.enableImpersonation && !clientImpersonationRequested {
+		if s.proxyAuthenticationEnabled() && !clientImpersonationRequested {
 			if err := s.processAuthentication(ctx, req); err != nil {
 				logger.Error(err, "authentication failed")
 				http.Error(wr, err.Error(), http.StatusUnauthorized)
@@ -399,9 +432,6 @@ func (s *serviceProxy) validate() error {
 	if s.key == "" {
 		return fmt.Errorf("key is required")
 	}
-	if s.oidc.issuerURL != "" && !s.enableImpersonation {
-		return fmt.Errorf("--oidc-issuer-url requires --enable-impersonation=true")
-	}
 	return validateOIDCOptions(s.oidc)
 }
 
@@ -430,9 +460,9 @@ func hasClientImpersonationHeaders(headers http.Header) bool {
 	return false
 }
 
-// processAuthentication handles the authentication flow for both managed cluster and hub users.
-// It tries managed cluster TokenReview first; if unauthenticated, falls back to hub TokenReview,
-// and finally to the configured OIDC issuer.
+// processAuthentication tries the managed cluster TokenReview first, followed by
+// each configured identity provider. Infrastructure errors stop the flow; only an
+// unauthenticated result falls through to the next provider.
 func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Request) error {
 	logger := klog.FromContext(ctx)
 
@@ -447,7 +477,7 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 	managedClusterResp, managedClusterAuthenticated, err := s.managedClusterAuthenticator.AuthenticateToken(ctx, token)
 	if err != nil {
 		if errors.Is(err, ErrTokenNotAuthenticated) {
-			logger.V(4).Info("managed cluster token not authenticated, trying hub", "error", err)
+			logger.V(4).Info("managed cluster token not authenticated, trying the next configured provider", "error", err)
 			managedClusterAuthenticated = false
 		} else {
 			return fmt.Errorf("managed cluster authentication failed: %v", err)
@@ -464,8 +494,11 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 		)
 	}
 
-	if !managedClusterAuthenticated {
-		// try hub authentication
+	if managedClusterAuthenticated {
+		return nil
+	}
+
+	if s.enableHubTokenAuthentication {
 		hubResp, hubAuthenticated, err := s.hubAuthenticator.AuthenticateToken(ctx, token)
 		if err != nil {
 			if errors.Is(err, ErrTokenNotAuthenticated) {
@@ -480,32 +513,34 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 			"authenticated", hubAuthenticated,
 		)
 
-		if !hubAuthenticated {
-			if s.oidcAuthenticator == nil {
-				logger.Error(nil, "authentication failed: token is neither valid for managed cluster nor hub cluster")
-				return fmt.Errorf("authentication failed: token is neither valid for managed cluster nor hub cluster")
+		if hubAuthenticated {
+			if err := s.processHubUser(ctx, req, hubResp.User); err != nil {
+				logger.Error(err, "failed to process hub user")
+				return fmt.Errorf("failed to process hub user: %v", err)
 			}
 
-			// try oidc authentication as the last fallback when configured
-			oidcResp, oidcAuthenticated, err := s.oidcAuthenticator.AuthenticateToken(ctx, token)
-			if err != nil {
-				if errors.Is(err, ErrTokenNotAuthenticated) {
-					logger.V(4).Info("oidc token not authenticated", "error", err)
-					oidcAuthenticated = false
-				} else {
-					logger.Error(err, "oidc authentication failed")
+			logger.V(6).Info("hub user processed successfully, impersonation headers applied")
+			return nil
+		}
+	}
+
+	if s.oidcAuthenticator != nil {
+		oidcResp, oidcAuthenticated, err := s.oidcAuthenticator.AuthenticateToken(ctx, token)
+		if err != nil {
+			if errors.Is(err, ErrTokenNotAuthenticated) {
+				logger.V(4).Info("oidc token not authenticated", "error", err)
+				oidcAuthenticated = false
+			} else {
+				logger.Error(err, "oidc authentication failed")
+				if s.enableHubTokenAuthentication {
 					return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, hub cluster auth: not authenticated, oidc auth error: %v", err)
 				}
+				return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, oidc auth error: %v", err)
 			}
-			logger.V(4).Info("oidc authentication result",
-				"authenticated", oidcAuthenticated,
-			)
+		}
+		logger.V(4).Info("oidc authentication result", "authenticated", oidcAuthenticated)
 
-			if !oidcAuthenticated {
-				logger.Error(nil, "authentication failed: token is not valid for managed cluster, hub cluster, or the configured OIDC issuer")
-				return fmt.Errorf("authentication failed: token is not valid for managed cluster, hub cluster, or the configured OIDC issuer")
-			}
-
+		if oidcAuthenticated {
 			if err := s.processOIDCUser(ctx, req, oidcResp.User); err != nil {
 				logger.Error(err, "failed to process oidc user")
 				return fmt.Errorf("failed to process oidc user: %v", err)
@@ -514,16 +549,24 @@ func (s *serviceProxy) processAuthentication(ctx context.Context, req *http.Requ
 			logger.V(6).Info("oidc user processed successfully, impersonation headers applied")
 			return nil
 		}
-
-		if err := s.processHubUser(ctx, req, hubResp.User); err != nil {
-			logger.Error(err, "failed to process hub user")
-			return fmt.Errorf("failed to process hub user: %v", err)
-		}
-
-		logger.V(6).Info("hub user processed successfully, impersonation headers applied")
 	}
 
-	return nil
+	err = errors.New(s.authenticationFailureMessage())
+	logger.Error(err, "authentication failed")
+	return err
+}
+
+func (s *serviceProxy) authenticationFailureMessage() string {
+	switch {
+	case s.enableHubTokenAuthentication && s.oidcAuthenticator != nil:
+		return "authentication failed: token is not valid for managed cluster, hub cluster, or the configured OIDC issuer"
+	case s.enableHubTokenAuthentication:
+		return "authentication failed: token is neither valid for managed cluster nor hub cluster"
+	case s.oidcAuthenticator != nil:
+		return "authentication failed: token is neither valid for managed cluster nor the configured OIDC issuer"
+	default:
+		return "authentication failed: token is not valid for the managed cluster"
+	}
 }
 
 // processOIDCUser handles the oidc user specific operations including impersonation

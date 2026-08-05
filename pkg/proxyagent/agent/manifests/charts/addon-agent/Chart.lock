@@ -3,4 +3,4 @@ dependencies:
   repository: file://../../../../../../charts/cluster-proxy-common
   version: 0.1.0
 digest: sha256:a1c3b816ef14785b81e3081bedaacc9707ccc744365c6d74a119740e5cb31dc0
-generated: "2026-06-19T03:21:40.181821373+09:00"
+generated: "2026-08-05T13:16:37.621216569+09:00"

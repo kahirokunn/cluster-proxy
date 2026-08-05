@@ -1,5 +1,7 @@
 {{- $clusterProxyImage := include "cluster-proxy-common.clusterProxyImage" . }}
 {{- $proxyAgentImage := include "cluster-proxy-common.proxyAgentImageOrDefault" . }}
+{{- $enableHubTokenAuthentication := eq (include "cluster-proxy-common.hubTokenAuthenticationEnabled" .) "true" }}
+{{- $enableOIDCAuthentication := eq (include "cluster-proxy-addon.oidcAuthenticationEnabled" .) "true" }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -147,9 +149,6 @@ spec:
         {{- if ne (empty .Values.oidcIssuerURL) (empty .Values.oidcClientID) }}
           {{- fail "oidcIssuerURL and oidcClientID must be specified together" }}
         {{- end }}
-        {{- if and .Values.oidcIssuerURL (ne .Values.enableImpersonation "true") }}
-          {{- fail "oidcIssuerURL requires enableImpersonation=true" }}
-        {{- end }}
         - name: service-proxy
           {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements }}
           {{- range $item := $reverseResourceRequirements }}
@@ -168,11 +167,11 @@ spec:
           {{- if .Values.additionalServiceCAConfigMap }}
             - --additional-service-ca=/additional-service-ca/service-ca.crt
           {{- end }}
-            - --enable-impersonation={{ .Values.enableImpersonation }}
+            - --enable-hub-token-authentication={{ $enableHubTokenAuthentication }}
             - --cert=/server-cert/tls.crt
             - --key=/server-cert/tls.key
             - --hub-kubeconfig=/etc/kubeconfig/kubeconfig
-          {{- if .Values.oidcIssuerURL }}
+          {{- if $enableOIDCAuthentication }}
             {{- /* values such as prefixes may end with a colon, so quote every arg */}}
             - {{ printf "--oidc-issuer-url=%s" .Values.oidcIssuerURL | quote }}
             - {{ printf "--oidc-client-id=%s" .Values.oidcClientID | quote }}
@@ -241,7 +240,7 @@ spec:
               mountPath: /additional-service-ca
               readOnly: true
             {{- end }}
-            {{- if and .Values.oidcIssuerURL .Values.oidcCAConfigMap }}
+            {{- if and $enableOIDCAuthentication .Values.oidcCAConfigMap }}
             - name: oidc-ca
               mountPath: /oidc-ca
               readOnly: true
@@ -272,7 +271,7 @@ spec:
             name: {{ .Values.additionalServiceCAConfigMap }}
             optional: true
         {{- end }}
-        {{- if and .Values.oidcIssuerURL .Values.oidcCAConfigMap }}
+        {{- if and $enableOIDCAuthentication .Values.oidcCAConfigMap }}
         - name: oidc-ca
           configMap:
             name: {{ .Values.oidcCAConfigMap }}
