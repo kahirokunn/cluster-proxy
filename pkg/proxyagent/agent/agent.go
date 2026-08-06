@@ -205,6 +205,9 @@ func GetClusterProxyValueFunc(
 		}, proxyConfig); err != nil {
 			return nil, err
 		}
+		if proxyConfig.Spec.ProxyServer.Replicas < 0 {
+			return nil, fmt.Errorf("proxy-server replicas must not be negative, got %d", proxyConfig.Spec.ProxyServer.Replicas)
+		}
 		additionalProxyAgentArgs, err := normalizeAdditionalProxyAgentArgs(proxyConfig.Spec.ProxyAgent.AdditionalArgs)
 		if err != nil {
 			return nil, err
@@ -290,26 +293,27 @@ func GetClusterProxyValueFunc(
 		agentIdentifiers := strings.Join(aids, "&")
 
 		values := map[string]interface{}{
-			"agentDeploymentName":          "cluster-proxy-proxy-agent",
-			"serviceDomain":                serviceDomain,
-			"includeNamespaceCreation":     true,
-			"spokeAddonNamespace":          namespace,
-			"additionalProxyAgentArgs":     additionalProxyAgentArgs,
-			"additionalServiceProxyArgs":   proxyConfig.Spec.ProxyAgent.AdditionalServiceProxyArgs,
-			"clusterName":                  cluster.Name,
-			"registry":                     registry,
-			"image":                        image,
-			"tag":                          tag,
-			"proxyAgentImage":              proxyConfig.Spec.ProxyAgent.Image,
-			"proxyAgentImagePullSecrets":   proxyConfig.Spec.ProxyAgent.ImagePullSecrets,
-			"replicas":                     proxyConfig.Spec.ProxyAgent.Replicas,
-			"base64EncodedCAData":          base64.StdEncoding.EncodeToString(caCertData),
-			"serviceEntryPoint":            serviceEntryPoint,
-			"serviceEntryPointPort":        serviceEntryPointPort,
-			"proxyAgentHealthPort":         proxyAgentHealthPort,
-			"agentDeploymentAnnotations":   annotations,
-			"addonAgentArgs":               addonAgentArgs,
-			"additionalServiceCAConfigMap": proxyConfig.Spec.ProxyAgent.AdditionalServiceCAConfigMap,
+			"agentDeploymentName":            "cluster-proxy-proxy-agent",
+			"serviceDomain":                  serviceDomain,
+			"includeNamespaceCreation":       true,
+			"spokeAddonNamespace":            namespace,
+			"additionalProxyAgentArgs":       additionalProxyAgentArgs,
+			"additionalServiceProxyArgs":     proxyConfig.Spec.ProxyAgent.AdditionalServiceProxyArgs,
+			"clusterName":                    cluster.Name,
+			"registry":                       registry,
+			"image":                          image,
+			"tag":                            tag,
+			"proxyAgentImage":                proxyConfig.Spec.ProxyAgent.Image,
+			"proxyAgentImagePullSecrets":     proxyConfig.Spec.ProxyAgent.ImagePullSecrets,
+			"replicas":                       proxyConfig.Spec.ProxyAgent.Replicas,
+			"base64EncodedCAData":            base64.StdEncoding.EncodeToString(caCertData),
+			"serviceEntryPoint":              serviceEntryPoint,
+			"serviceEntryPointPort":          serviceEntryPointPort,
+			"proxyAgentHealthPort":           proxyAgentHealthPort,
+			"expectedProxyServerConnections": proxyConfig.Spec.ProxyServer.Replicas,
+			"agentDeploymentAnnotations":     annotations,
+			"addonAgentArgs":                 addonAgentArgs,
+			"additionalServiceCAConfigMap":   proxyConfig.Spec.ProxyAgent.AdditionalServiceCAConfigMap,
 			// support to access not only but also other services on managed cluster
 			"agentIdentifiers":   agentIdentifiers,
 			"serviceProxyHost":   serviceProxyHost,
@@ -397,7 +401,7 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1beta1.AddOnDe
 	return func(config addonv1beta1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 		values := addonfactory.Values{}
 		for _, variable := range config.Spec.CustomizedVariables {
-			if variable.Name == "proxyAgentHealthPort" {
+			if variable.Name == "proxyAgentHealthPort" || variable.Name == "expectedProxyServerConnections" {
 				return nil, fmt.Errorf("customized variable %q is controller-owned and cannot be overridden", variable.Name)
 			}
 			values[variable.Name] = variable.Value

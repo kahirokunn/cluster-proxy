@@ -15,6 +15,7 @@ import (
 	"net"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -148,14 +149,18 @@ func TestNormalizeAdditionalProxyAgentArgs(t *testing.T) {
 	}
 }
 
-func TestToAgentAddOnChartValuesRejectsHealthPortOverride(t *testing.T) {
-	config := addonv1beta1.AddOnDeploymentConfig{
-		Spec: addonv1beta1.AddOnDeploymentConfigSpec{
-			CustomizedVariables: []addonv1beta1.CustomizedVariable{{Name: "proxyAgentHealthPort", Value: "8094"}},
-		},
+func TestToAgentAddOnChartValuesRejectsControllerOwnedOverrides(t *testing.T) {
+	for _, name := range []string{"proxyAgentHealthPort", "expectedProxyServerConnections"} {
+		t.Run(name, func(t *testing.T) {
+			config := addonv1beta1.AddOnDeploymentConfig{
+				Spec: addonv1beta1.AddOnDeploymentConfigSpec{
+					CustomizedVariables: []addonv1beta1.CustomizedVariable{{Name: name, Value: "9"}},
+				},
+			}
+			_, err := toAgentAddOnChartValues(nil)(config)
+			assert.ErrorContains(t, err, "controller-owned")
+		})
 	}
-	_, err := toAgentAddOnChartValues(nil)(config)
-	assert.ErrorContains(t, err, "controller-owned")
 }
 
 func TestRemoveDupAndSortservicesToExpose(t *testing.T) {
@@ -509,6 +514,35 @@ func TestNewAgentAddon(t *testing.T) {
 				assert.NotNil(t, agentDeploy)
 				assert.Equal(t, *agentDeploy.Spec.Replicas, int32(2))
 			},
+		},
+		{
+			name:    "zero proxy-server replicas",
+			cluster: newCluster(clusterName, true),
+			addon: func() *addonv1beta1.ManagedClusterAddOn {
+				addOn := newAddOn(addOnName, clusterName)
+				addOn.Status.ConfigReferences = []addonv1beta1.ConfigReference{newManagedProxyConfigReference(managedProxyConfigName)}
+				return addOn
+			}(),
+			managedProxyConfig:      setProxyServerReplicas(newManagedProxyConfig(managedProxyConfigName, proxyv1alpha1.EntryPointTypeHostname), 0),
+			addOndDeploymentConfigs: []runtime.Object{},
+			kubeObjs:                []runtime.Object{},
+			enableKubeApiProxy:      true,
+			verifyManifests:         func(*testing.T, []runtime.Object) {},
+		},
+		{
+			name:    "negative proxy-server replicas",
+			cluster: newCluster(clusterName, true),
+			addon: func() *addonv1beta1.ManagedClusterAddOn {
+				addOn := newAddOn(addOnName, clusterName)
+				addOn.Status.ConfigReferences = []addonv1beta1.ConfigReference{newManagedProxyConfigReference(managedProxyConfigName)}
+				return addOn
+			}(),
+			managedProxyConfig:      setProxyServerReplicas(newManagedProxyConfig(managedProxyConfigName, proxyv1alpha1.EntryPointTypeHostname), -1),
+			addOndDeploymentConfigs: []runtime.Object{},
+			kubeObjs:                []runtime.Object{},
+			enableKubeApiProxy:      true,
+			expectedErrorMsg:        "proxy-server replicas must not be negative",
+			verifyManifests:         func(*testing.T, []runtime.Object) {},
 		},
 		{
 			name:    "port forward proxy server",
@@ -1124,7 +1158,8 @@ func TestNewAgentAddon(t *testing.T) {
 			assert.NoError(t, err)
 			agentDeployment := getAgentDeployment(manifests)
 			assertPodSecurityContext(t, agentDeployment)
-			assertContainerProbeMatrix(t, agentDeployment, c.enableServiceProxy)
+			expectedProxyServerConnections := c.managedProxyConfig.(*proxyv1alpha1.ManagedProxyConfiguration).Spec.ProxyServer.Replicas
+			assertContainerProbeMatrix(t, agentDeployment, c.enableServiceProxy, expectedProxyServerConnections)
 			c.verifyManifests(t, manifests)
 		})
 	}
@@ -1277,7 +1312,12 @@ func TestImpersonationRBACConfiguration(t *testing.T) {
 	}
 }
 
-func assertContainerProbeMatrix(t *testing.T, deploy *appsv1.Deployment, serviceProxyEnabled bool) {
+func assertContainerProbeMatrix(
+	t *testing.T,
+	deploy *appsv1.Deployment,
+	serviceProxyEnabled bool,
+	expectedProxyServerConnections int32,
+) {
 	t.Helper()
 	if !assert.NotNil(t, deploy) {
 		return
@@ -1298,25 +1338,36 @@ func assertContainerProbeMatrix(t *testing.T, deploy *appsv1.Deployment, service
 		assert.Equal(t, timeout, probe.TimeoutSeconds)
 		assert.Equal(t, failure, probe.FailureThreshold)
 	}
+	countExactArg := func(args []string, expected string) int {
+		count := 0
+		for _, arg := range args {
+			if arg == expected {
+				count++
+			}
+		}
+		return count
+	}
 
 	proxyAgent := getDeploymentContainer(deploy, "proxy-agent")
 	if assert.NotNil(t, proxyAgent) {
 		assertHTTPProbe("proxy-agent liveness", proxyAgent.LivenessProbe, "/proxy-agent-healthz", 8888, 10, 10, 2, 1)
 		assertHTTPProbe("proxy-agent readiness", proxyAgent.ReadinessProbe, "/readyz", proxyAgentHealthPort, 5, 2, 1, 1)
-		assert.Nil(t, proxyAgent.StartupProbe)
-		assert.Contains(t, proxyAgent.Args, "--health-server-port=8093")
+		assertHTTPProbe("proxy-agent startup", proxyAgent.StartupProbe, "/startupz", 8888, 0, 2, 2, 150)
+		assert.Equal(t, 1, countExactArg(proxyAgent.Args, "--health-server-port=8093"))
 	}
 	addonAgent := getDeploymentContainer(deploy, "addon-agent")
 	if assert.NotNil(t, addonAgent) {
 		assertHTTPProbe("addon-agent liveness", addonAgent.LivenessProbe, "/healthz", 8888, 10, 10, 2, 3)
 		assertHTTPProbe("addon-agent readiness", addonAgent.ReadinessProbe, "/readyz", 8888, 5, 2, 1, 1)
 		assert.Nil(t, addonAgent.StartupProbe)
-		assert.Contains(t, addonAgent.Args, "--proxy-agent-health-port=8093")
-		assert.Contains(t, addonAgent.VolumeMounts, corev1.VolumeMount{
+		assert.Equal(t, 1, countExactArg(addonAgent.Args, "--proxy-agent-health-port=8093"))
+		assert.Equal(t, 1, countExactArg(addonAgent.Args,
+			"--expected-proxy-server-connections="+strconv.Itoa(int(expectedProxyServerConnections))))
+		assert.Equal(t, corev1.VolumeMount{
 			Name:      "ca",
 			MountPath: "/etc/ca",
 			ReadOnly:  true,
-		})
+		}, findVolumeMount(addonAgent.VolumeMounts, "ca"))
 	}
 	serviceProxy := getDeploymentContainer(deploy, "service-proxy")
 	if !serviceProxyEnabled {
@@ -1327,7 +1378,21 @@ func assertContainerProbeMatrix(t *testing.T, deploy *appsv1.Deployment, service
 		assertHTTPProbe("service-proxy liveness", serviceProxy.LivenessProbe, "/healthz", 8000, 10, 10, 2, 3)
 		assertHTTPProbe("service-proxy readiness", serviceProxy.ReadinessProbe, "/readyz", 8000, 5, 2, 1, 1)
 		assert.Nil(t, serviceProxy.StartupProbe)
+		if assert.NotNil(t, serviceProxy.Lifecycle) &&
+			assert.NotNil(t, serviceProxy.Lifecycle.PreStop) &&
+			assert.NotNil(t, serviceProxy.Lifecycle.PreStop.Exec) {
+			assert.Equal(t, []string{"/bin/sleep", "5"}, serviceProxy.Lifecycle.PreStop.Exec.Command)
+		}
 	}
+}
+
+func findVolumeMount(volumeMounts []corev1.VolumeMount, name string) corev1.VolumeMount {
+	for _, volumeMount := range volumeMounts {
+		if volumeMount.Name == name {
+			return volumeMount
+		}
+	}
+	return corev1.VolumeMount{}
 }
 
 func assertPodSecurityContext(t *testing.T, deploy *appsv1.Deployment) {
@@ -1497,6 +1562,7 @@ func newManagedProxyConfig(name string, entryPointType proxyv1alpha1.EntryPointT
 		},
 		Spec: proxyv1alpha1.ManagedProxyConfigurationSpec{
 			ProxyServer: proxyv1alpha1.ManagedProxyConfigurationProxyServer{
+				Replicas: 3,
 				Entrypoint: &proxyv1alpha1.ManagedProxyConfigurationProxyServerEntrypoint{
 					Type: entryPointType,
 					LoadBalancerService: &proxyv1alpha1.EntryPointLoadBalancerService{
@@ -1509,10 +1575,16 @@ func newManagedProxyConfig(name string, entryPointType proxyv1alpha1.EntryPointT
 				Namespace: "test",
 			},
 			ProxyAgent: proxyv1alpha1.ManagedProxyConfigurationProxyAgent{
-				Image: "quay.io/open-cluster-management.io/cluster-proxy-agent:test",
+				Image:    "quay.io/open-cluster-management.io/cluster-proxy-agent:test",
+				Replicas: 1,
 			},
 		},
 	}
+}
+
+func setProxyServerReplicas(mpc *proxyv1alpha1.ManagedProxyConfiguration, replicas int32) *proxyv1alpha1.ManagedProxyConfiguration {
+	mpc.Spec.ProxyServer.Replicas = replicas
+	return mpc
 }
 
 func setProxyAgentReplicas(mpc *proxyv1alpha1.ManagedProxyConfiguration, replicas int32) *proxyv1alpha1.ManagedProxyConfiguration {
