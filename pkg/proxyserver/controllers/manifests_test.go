@@ -10,6 +10,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
+	"open-cluster-management.io/cluster-proxy/pkg/common"
 	sdktls "open-cluster-management.io/sdk-go/pkg/tls"
 )
 
@@ -117,6 +118,7 @@ func TestNewProxyServerDeployment_SetsHTTPProbes(t *testing.T) {
 		t.Fatalf("unexpected container count: got %d, want 1", len(deploy.Spec.Template.Spec.Containers))
 	}
 	container := deploy.Spec.Template.Spec.Containers[0]
+	assert.NotEmpty(t, deploy.Annotations[common.AnnotationKeyProxyServerSpecHash])
 
 	assertHTTPProbe := func(name string, probe *corev1.Probe) {
 		t.Helper()
@@ -144,6 +146,26 @@ func TestNewProxyServerDeployment_SetsHTTPProbes(t *testing.T) {
 	assert.Equal(t, int32(1), container.ReadinessProbe.TimeoutSeconds)
 	assert.Equal(t, int32(1), container.ReadinessProbe.FailureThreshold)
 	assert.Nil(t, container.StartupProbe)
+}
+
+func TestProxyServerSpecHashChangesWithPodSpec(t *testing.T) {
+	config := newTestConfig(3)
+	baseline, err := newProxyServerDeployment(config, "IfNotPresent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed := config.DeepCopy()
+	changed.Spec.ProxyServer.Image = "example.invalid/cluster-proxy:new"
+	updated, err := newProxyServerDeployment(changed, "IfNotPresent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotEqual(t,
+		baseline.Annotations[common.AnnotationKeyProxyServerSpecHash],
+		updated.Annotations[common.AnnotationKeyProxyServerSpecHash],
+	)
 }
 
 func TestNewProxyServerDeployment_UsesTypedHealthPort(t *testing.T) {
