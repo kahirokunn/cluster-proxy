@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
 const (
@@ -152,4 +155,63 @@ func GetProxyType(reqURI string) int {
 		return ProxyTypeService
 	}
 	return ProxyTypeKubeAPIServer
+}
+
+func newHealthProbeHandler(livenessChecks, readinessChecks map[string]healthz.Checker) http.Handler {
+	mux := http.NewServeMux()
+	mountHealthProbeHandler(mux, "/healthz", livenessChecks)
+	mountHealthProbeHandler(mux, "/readyz", readinessChecks)
+	return mux
+}
+
+func mountHealthProbeHandler(mux *http.ServeMux, basePath string, checks map[string]healthz.Checker) {
+	handler := http.StripPrefix(basePath, &healthz.Handler{Checks: checks})
+	// Register both patterns so the aggregate endpoint does not redirect while
+	// named checks remain available below it, matching controller-runtime's
+	// health handler at both /healthz and /healthz/<check-name>.
+	mux.Handle(basePath, handler)
+	mux.Handle(basePath+"/", handler)
+}
+
+func legacyHealthChecks(customChecks []healthz.Checker) map[string]healthz.Checker {
+	checks := map[string]healthz.Checker{
+		"healthz-ping": healthz.Ping,
+	}
+
+	for i, check := range customChecks {
+		checks[fmt.Sprintf("custom-healthz-checker-%d", i)] = check
+	}
+	return checks
+}
+
+// ServeHealthProbes serves the same checks as both liveness and readiness probes over HTTP.
+func ServeHealthProbes(healthProbeBindAddress string, customChecks ...healthz.Checker) error {
+	checks := legacyHealthChecks(customChecks)
+	return serveHealthProbes(healthProbeBindAddress, checks, checks)
+}
+
+// ServeHealthProbesWithLivenessAndReadinessChecks serves independently named
+// liveness checks on /healthz and readiness checks on /readyz over HTTP.
+func ServeHealthProbesWithLivenessAndReadinessChecks(
+	healthProbeBindAddress string,
+	livenessChecks map[string]healthz.Checker,
+	readinessChecks map[string]healthz.Checker,
+) error {
+
+	return serveHealthProbes(healthProbeBindAddress, livenessChecks, readinessChecks)
+}
+
+func serveHealthProbes(
+	healthProbeBindAddress string,
+	livenessChecks map[string]healthz.Checker,
+	readinessChecks map[string]healthz.Checker,
+) error {
+
+	server := http.Server{
+		Handler:           newHealthProbeHandler(livenessChecks, readinessChecks),
+		ReadHeaderTimeout: 5 * time.Second,
+		Addr:              healthProbeBindAddress,
+	}
+	klog.Infof("health probe server is listening on %s", healthProbeBindAddress)
+	return server.ListenAndServe()
 }
