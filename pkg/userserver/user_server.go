@@ -34,6 +34,7 @@ import (
 	konnectivity "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
 func NewUserServerCommand() *cobra.Command {
@@ -282,7 +283,8 @@ func (k *userServer) Run(ctx context.Context) error {
 		CipherSuites: sdkTLSConfig.CipherSuites,
 	}
 
-	healthServer := utils.NewHealthProbeServer(":8000", cc.Check)
+	checks := map[string]healthz.Checker{"config-checksum": cc.Check}
+	healthServer := utils.NewHealthProbeServer(":8000", checks, checks)
 	publicServer := utils.NewProxyHTTPServer(fmt.Sprintf(":%d", k.serverPort), tlsConfig, k)
 
 	klog.Infof("starting user HTTPS server on %d and health server on 8000", k.serverPort)
