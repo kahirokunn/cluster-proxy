@@ -32,6 +32,7 @@ const (
 	LabelKeyComponentName                = "proxy.open-cluster-management.io/component-name"
 	AnnotationKeyConfigurationGeneration = "proxy.open-cluster-management.io/configuration-generation"
 	AnnotationKeyTLSConfigHash           = "proxy.open-cluster-management.io/tls-config-hash"
+	AnnotationKeyProxyServerSpecHash     = "proxy.open-cluster-management.io/proxy-server-spec-hash"
 )
 
 const (

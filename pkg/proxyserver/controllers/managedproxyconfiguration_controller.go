@@ -38,6 +38,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -101,6 +102,7 @@ func (c *ManagedProxyConfigurationReconciler) SetupWithManager(mgr ctrl.Manager)
 	// TODO should add a filter to only watch addon with cluster-proxy name
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.ManagedProxyConfiguration{}).
+		Owns(&corev1.Secret{}, builder.MatchEveryOwner).
 		Complete(c)
 }
 
@@ -278,10 +280,12 @@ func (c *ManagedProxyConfigurationReconciler) ensure(incomingGeneration int64, g
 		return created, false, nil
 	}
 
-	// update if generation bumped or TLS config changed
+	// Update when the API generation, TLS profile, or rendered proxy-server spec changes.
 	tlsHashChanged := resource.GetAnnotations()[common.AnnotationKeyTLSConfigHash] !=
 		current.GetAnnotations()[common.AnnotationKeyTLSConfigHash]
-	if !created && (int(incomingGeneration) > currentGeneration || tlsHashChanged) {
+	proxyServerSpecHashChanged := resource.GetAnnotations()[common.AnnotationKeyProxyServerSpecHash] !=
+		current.GetAnnotations()[common.AnnotationKeyProxyServerSpecHash]
+	if !created && (int(incomingGeneration) > currentGeneration || tlsHashChanged || proxyServerSpecHashChanged) {
 		resource.SetResourceVersion(current.GetResourceVersion())
 		if err := c.Update(context.TODO(), resource); err != nil {
 			if apierrors.IsConflict(err) {
