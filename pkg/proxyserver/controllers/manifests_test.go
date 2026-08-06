@@ -9,6 +9,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
+	"open-cluster-management.io/cluster-proxy/pkg/common"
 	sdktls "open-cluster-management.io/sdk-go/pkg/tls"
 )
 
@@ -87,7 +88,10 @@ func TestNewProxyServerDeployment_SetsPodSecurityContext(t *testing.T) {
 	config.Spec.ProxyServer.Namespace = "test"
 	config.Spec.ProxyServer.Image = "quay.io/open-cluster-management/cluster-proxy:test"
 
-	deploy := newProxyServerDeployment(config, "IfNotPresent", nil)
+	deploy, err := newProxyServerDeployment(config, "IfNotPresent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	expected := &corev1.PodSecurityContext{
 		RunAsNonRoot: ptr.To(true),
@@ -96,6 +100,27 @@ func TestNewProxyServerDeployment_SetsPodSecurityContext(t *testing.T) {
 		},
 	}
 	assert.Equal(t, expected, deploy.Spec.Template.Spec.SecurityContext)
+	assert.NotEmpty(t, deploy.Annotations[common.AnnotationKeyProxyServerSpecHash])
+}
+
+func TestProxyServerSpecHashChangesWithPodSpec(t *testing.T) {
+	config := newTestConfig(3)
+	baseline, err := newProxyServerDeployment(config, "IfNotPresent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed := config.DeepCopy()
+	changed.Spec.ProxyServer.Image = "example.invalid/cluster-proxy:new"
+	updated, err := newProxyServerDeployment(changed, "IfNotPresent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotEqual(t,
+		baseline.Annotations[common.AnnotationKeyProxyServerSpecHash],
+		updated.Annotations[common.AnnotationKeyProxyServerSpecHash],
+	)
 }
 
 func TestTLSConfigHash_Nil(t *testing.T) {

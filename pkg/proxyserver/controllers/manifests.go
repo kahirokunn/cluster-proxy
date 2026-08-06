@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -82,13 +83,17 @@ func newProxyService(config *proxyv1alpha1.ManagedProxyConfiguration) *corev1.Se
 	}
 }
 
-func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, imagePullPolicy string, tlsConfig *sdktls.TLSConfig) *appsv1.Deployment {
+func newProxyServerDeployment(
+	config *proxyv1alpha1.ManagedProxyConfiguration,
+	imagePullPolicy string,
+	tlsConfig *sdktls.TLSConfig,
+) (*appsv1.Deployment, error) {
 	deployAnnotations := map[string]string{}
 	if hash := tlsConfigHash(tlsConfig); hash != "" {
 		deployAnnotations[common.AnnotationKeyTLSConfigHash] = hash
 	}
 
-	return &appsv1.Deployment{
+	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: config.Spec.ProxyServer.Namespace,
 			Name:      config.Name,
@@ -195,6 +200,12 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 			},
 		},
 	}
+	specHash, err := proxyServerSpecHash(deployment.Spec)
+	if err != nil {
+		return nil, err
+	}
+	deployment.Annotations[common.AnnotationKeyProxyServerSpecHash] = specHash
+	return deployment, nil
 }
 
 func newProxyServerRole(config *proxyv1alpha1.ManagedProxyConfiguration) *rbacv1.Role {
@@ -273,4 +284,12 @@ func tlsConfigHash(tlsConfig *sdktls.TLSConfig) string {
 	h.Write([]byte{0})
 	h.Write([]byte(sdktls.VersionToString(tlsConfig.MinVersion)))
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
+}
+
+func proxyServerSpecHash(spec appsv1.DeploymentSpec) (string, error) {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("marshal proxy-server deployment spec: %w", err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))[:16], nil
 }
