@@ -193,20 +193,6 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		return err
 	}
 
-	sdkTLSConfig, err := sdktls.StartTLSConfigMapWatcher(runCtx, s.managedClusterKubeClient, s.podNamespace, func() {
-		klog.Info("TLS ConfigMap changed, shutting down gracefully for restart")
-		cancel()
-	})
-	if err != nil {
-		return fmt.Errorf("failed to start TLS ConfigMap watcher: %w", err)
-	}
-	klog.Infof("TLS config loaded: minVersion=%s, ciphersuites=%s", sdktls.VersionToString(sdkTLSConfig.MinVersion),
-		sdktls.CipherSuitesToString(sdkTLSConfig.CipherSuites))
-
-	tlsConfig := &tls.Config{
-		MinVersion:   sdkTLSConfig.MinVersion,
-		CipherSuites: sdkTLSConfig.CipherSuites,
-	}
 	serverCertificate, err := tls.LoadX509KeyPair(s.cert, s.key)
 	if err != nil {
 		return fmt.Errorf("failed to load service proxy certificate: %w", err)
@@ -218,19 +204,36 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse service proxy certificate: %w", err)
 	}
-	tlsConfig.Certificates = []tls.Certificate{serverCertificate}
+	baseTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+	}
+	dynamicTLSConfig, err := utils.StartDynamicTLSConfigMapWatcherWithValidator(
+		runCtx,
+		s.managedClusterKubeClient,
+		s.podNamespace,
+		utils.ServingTLSProfileValidator(baseTLSConfig),
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to start TLS ConfigMap watcher: %w", err)
+	}
+	sdkTLSConfig := dynamicTLSConfig.Current()
+	klog.Infof("TLS config loaded: minVersion=%s, ciphersuites=%s", sdktls.VersionToString(sdkTLSConfig.MinVersion),
+		sdktls.CipherSuitesToString(sdkTLSConfig.CipherSuites))
+	tlsConfig := dynamicTLSConfig.ServerConfig(baseTLSConfig)
 
 	servingCertRoots := x509.NewCertPool()
 	servingCertRoots.AddCert(serverLeafCertificate)
 	readinessChecks := make(map[string]healthz.Checker, len(livenessChecks)+1)
 	maps.Copy(readinessChecks, livenessChecks)
-	readinessChecks["service-proxy-tls"] = newTLSHealthChecker(
+	healthTLSConfig := &tls.Config{
+		RootCAs:    servingCertRoots,
+		ServerName: "127.0.0.1",
+	}
+	readinessChecks["service-proxy-tls"] = utils.NewDynamicTLSHealthChecker(
 		fmt.Sprintf("127.0.0.1:%d", constant.ServiceProxyPort),
-		&tls.Config{
-			MinVersion:   sdkTLSConfig.MinVersion,
-			CipherSuites: sdkTLSConfig.CipherSuites,
-			RootCAs:      servingCertRoots,
-			ServerName:   "127.0.0.1",
+		func() *tls.Config {
+			return dynamicTLSConfig.ClientConfig(healthTLSConfig)
 		},
 		tlsHealthCheckTimeout,
 	)
