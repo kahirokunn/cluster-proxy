@@ -100,10 +100,10 @@ validate-values-schema: ## Verify the generated addon-agent Helm values schema i
 	diff -u values.schema.json "$$tmp/values.schema.json"
 
 test: manifests generate fmt vet envtest-setup ## Run tests.
-	go test ./pkg/... -coverprofile cover.out
+	go test ./pkg/... ./cmd/... -coverprofile cover.out
 
 .PHONY: test-helm
-test-helm: verify-helm-dependencies validate-values-schema ## Lint and render Helm charts.
+test-helm: verify-helm-dependencies validate-values-schema verify-agent-startup-gate ## Lint and render Helm charts.
 	$(HELM) lint charts/cluster-proxy
 	$(HELM) template cluster-proxy charts/cluster-proxy \
 		--namespace open-cluster-management-addon >/dev/null
@@ -139,6 +139,22 @@ test-helm: verify-helm-dependencies validate-values-schema ## Lint and render He
 	{ ! $(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
 		--namespace open-cluster-management-agent-addon \
 		--set oidcReservedNamePrefixes=null 2>&1; } | grep -q oidcReservedNamePrefixes
+
+.PHONY: verify-agent-startup-gate
+verify-agent-startup-gate:
+	@$(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
+		--namespace open-cluster-management-agent-addon \
+		--show-only templates/addon-agent-deployment.yaml | \
+		grep -Eq '^[[:space:]]+path: /startupz$$'
+	@$(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
+		--namespace open-cluster-management-agent-addon \
+		--set expectedProxyServerConnections=0 \
+		--show-only templates/addon-agent-deployment.yaml | \
+		grep -Eq '^[[:space:]]+- --expected-proxy-server-connections=0$$'
+	@{ ! $(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
+		--namespace open-cluster-management-agent-addon \
+		--set 'addonAgentArgs={--expected-proxy-server-connections=9}' 2>&1; } | \
+		grep -q controller-owned
 
 ##@ Build
 

@@ -25,8 +25,8 @@
   {{- end }}
 {{- end }}
 {{- range $arg := .Values.addonAgentArgs }}
-  {{- if regexMatch "^--proxy-agent-health-port(=|$)" (toString $arg) }}
-    {{- fail "addonAgentArgs must not override --proxy-agent-health-port" }}
+  {{- if regexMatch "^--(proxy-agent-health-port|expected-proxy-server-connections)(=|$)" (toString $arg) }}
+    {{- fail "addonAgentArgs must not override controller-owned health or startup flags" }}
   {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -126,6 +126,16 @@ spec:
             failureThreshold: 1
             periodSeconds: 2
             timeoutSeconds: 1
+          # A replacement Pod must connect to every configured proxy-server
+          # before Kubernetes can terminate the previous available Pod.
+          startupProbe:
+            httpGet:
+              path: /startupz
+              scheme: HTTP
+              port: 8888
+            failureThreshold: 150
+            periodSeconds: 2
+            timeoutSeconds: 2
           env:
             {{- if .Values.proxyConfig.HTTP_PROXY }}
             - name: HTTP_PROXY
@@ -167,6 +177,7 @@ spec:
             - {{ . | quote }}
             {{- end }}
             - --proxy-agent-health-port={{ .Values.proxyAgentHealthPort }}
+            - --expected-proxy-server-connections={{ .Values.expectedProxyServerConnections }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -273,6 +284,15 @@ spec:
             {{- range .Values.additionalServiceProxyArgs }}
             - {{ . | quote }}
             {{- end }}
+          # The proxy-agent sends a DRAIN packet on SIGTERM. Keep the local
+          # service endpoint alive long enough for every proxy-server to stop
+          # assigning new requests to this Pod before shutting it down.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sleep
+                  - "5"
           livenessProbe:
             httpGet:
               path: /healthz
