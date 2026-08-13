@@ -59,7 +59,6 @@ func TestTLSHealthCheckerRejectsInvalidServers(t *testing.T) {
 		checker := newTLSHealthChecker(server.Listener.Addr().String(), &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    x509.NewCertPool(),
-			ServerName: "127.0.0.1",
 		}, time.Second)
 		if err := checker(httptest.NewRequest(http.MethodGet, "/readyz", nil)); err == nil {
 			t.Fatal("expected an untrusted TLS server to be unhealthy")
@@ -85,24 +84,11 @@ func TestTLSHealthCheckerRejectsInvalidServers(t *testing.T) {
 		}
 		defer listener.Close()
 
-		accepted := make(chan net.Conn, 1)
-		go func() {
-			conn, err := listener.Accept()
-			if err == nil {
-				accepted <- conn
-			}
-			close(accepted)
-		}()
-
 		checker := newTLSHealthChecker(listener.Addr().String(), &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		}, 20*time.Millisecond)
 		if err := checker(httptest.NewRequest(http.MethodGet, "/readyz", nil)); err == nil {
 			t.Fatal("expected a stalled TLS handshake to be unhealthy")
-		}
-
-		if conn := <-accepted; conn != nil {
-			conn.Close()
 		}
 	})
 }
@@ -113,7 +99,6 @@ func tlsConfigForServer(server *httptest.Server) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		RootCAs:    roots,
-		ServerName: "127.0.0.1",
 	}
 }
 

@@ -170,11 +170,15 @@ func (c *ManagedProxyConfigurationReconciler) refreshStatus(isModified bool, con
 }
 
 func (c *ManagedProxyConfigurationReconciler) deployProxyServer(config *proxyv1alpha1.ManagedProxyConfiguration) (bool, error) {
+	proxyServerDeployment, err := newProxyServerDeployment(config, c.imagePullPolicy, c.tlsConfig)
+	if err != nil {
+		return false, err
+	}
 	resources := []client.Object{
 		newServiceAccount(config),
 		newProxyService(config),
 		newProxySecret(config, c.SelfSigner.CAData()),
-		newProxyServerDeployment(config, c.imagePullPolicy, c.tlsConfig),
+		proxyServerDeployment,
 		newProxyServerRole(config),
 		newProxyServerRoleBinding(config),
 	}
