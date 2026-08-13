@@ -55,6 +55,16 @@ spec:
         open-cluster-management.io/addon: cluster-proxy
         proxy.open-cluster-management.io/component-name: proxy-agent
     spec:
+      {{- if gt (int .Values.replicas) 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              open-cluster-management.io/addon: cluster-proxy
+              proxy.open-cluster-management.io/component-name: proxy-agent
+      {{- end }}
       {{- if .Values.serviceProxyHost }}
       hostAliases:
       - ip: "127.0.0.1"

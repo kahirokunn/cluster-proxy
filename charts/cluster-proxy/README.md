@@ -25,7 +25,7 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `registry`                              | Registry used with `image` and `tag`                              | `quay.io/open-cluster-management`               |
 | `image`                                 | Cluster-proxy image name                                          | `cluster-proxy`                                 |
 | `tag`                                   | Cluster-proxy image tag                                           | `v<chart version>`                              |
-| `replicas`                              | Replicas for hub deployments                                      | `1`                                             |
+| `replicas`                              | Replicas for hub and managed-cluster workloads                    | `1`                                             |
 | `spokeAddonNamespace`                   | Default managed cluster addon namespace                           | `open-cluster-management-cluster-proxy`         |
 | `proxyServerImage`                      | Default apiserver-network-proxy server image                      | `quay.io/open-cluster-management/cluster-proxy` |
 | `proxyAgentImage`                       | Default apiserver-network-proxy agent image                       | `quay.io/open-cluster-management/cluster-proxy` |
@@ -55,6 +55,17 @@ previous available Pod until the new agent is connected to every configured
 proxy-server. If an image violates this contract, the old Pod is retained and
 the rollout safely stops. A configured proxy-server replica count of zero skips
 the metrics request and the startup gate succeeds immediately.
+
+### Updates and optional high availability
+
+The default remains one replica. Proxy-server image and configuration changes
+use a standard Kubernetes rolling update while the stable Service continues to
+select ready proxy-server Pods. No custom rollout resource or second deployment
+slot is required.
+
+Set `replicas` to two or more to add best-effort hostname topology spreading and
+PodDisruptionBudgets for the hub and managed-cluster workloads. The chart omits
+those disruption budgets at the default single-replica setting.
 
 ### Service Proxy and User Server Configuration
 

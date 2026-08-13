@@ -103,7 +103,7 @@ test: manifests generate fmt vet envtest-setup ## Run tests.
 	go test ./pkg/... ./cmd/... -coverprofile cover.out
 
 .PHONY: test-helm
-test-helm: verify-helm-dependencies validate-values-schema verify-agent-startup-gate ## Lint and render Helm charts.
+test-helm: verify-helm-dependencies validate-values-schema verify-agent-startup-gate verify-ha-manifests ## Lint and render Helm charts.
 	$(HELM) lint charts/cluster-proxy
 	$(HELM) template cluster-proxy charts/cluster-proxy \
 		--namespace open-cluster-management-addon >/dev/null
@@ -155,6 +155,35 @@ verify-agent-startup-gate:
 		--namespace open-cluster-management-agent-addon \
 		--set 'addonAgentArgs={--expected-proxy-server-connections=9}' 2>&1; } | \
 		grep -q controller-owned
+
+.PHONY: verify-ha-manifests
+verify-ha-manifests:
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	$(HELM) template cluster-proxy charts/cluster-proxy \
+		--namespace open-cluster-management-addon >"$$tmp/hub-single.yaml"; \
+	if grep -q '^kind: PodDisruptionBudget$$' "$$tmp/hub-single.yaml"; then \
+		echo 'hub chart rendered a PodDisruptionBudget for replicas=1' >&2; \
+		exit 1; \
+	fi; \
+	$(HELM) template cluster-proxy charts/cluster-proxy \
+		--namespace open-cluster-management-addon \
+		--set replicas=2 \
+		--set enableServiceProxy=true >"$$tmp/hub-ha.yaml"; \
+	test "$$(grep -c '^kind: PodDisruptionBudget$$' "$$tmp/hub-ha.yaml")" -eq 3; \
+	grep -q 'topologySpreadConstraints:' "$$tmp/hub-ha.yaml"; \
+	$(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
+		--namespace open-cluster-management-agent-addon >"$$tmp/agent-single.yaml"; \
+	if grep -q '^kind: PodDisruptionBudget$$' "$$tmp/agent-single.yaml"; then \
+		echo 'addon-agent chart rendered a PodDisruptionBudget for replicas=1' >&2; \
+		exit 1; \
+	fi; \
+	$(HELM) template addon-agent pkg/proxyagent/agent/manifests/charts/addon-agent \
+		--namespace open-cluster-management-agent-addon \
+		--set replicas=2 >"$$tmp/agent-ha.yaml"; \
+	test "$$(grep -c '^kind: PodDisruptionBudget$$' "$$tmp/agent-ha.yaml")" -eq 1; \
+	grep -q 'topologySpreadConstraints:' "$$tmp/agent-ha.yaml"
 
 ##@ Build
 

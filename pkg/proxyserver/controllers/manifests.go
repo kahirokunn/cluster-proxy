@@ -125,7 +125,11 @@ func newProxyServerDeployment(
 				},
 			},
 			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RecreateDeploymentStrategyType,
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: ptr.To(intstr.FromInt(0)),
+					MaxSurge:       ptr.To(intstr.FromInt(1)),
+				},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -240,6 +244,20 @@ func newProxyServerDeployment(
 				},
 			},
 		},
+	}
+	if config.Spec.ProxyServer.Replicas > 1 {
+		deployment.Spec.Template.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{
+			{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelHostname,
+				WhenUnsatisfiable: corev1.ScheduleAnyway,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						common.LabelKeyComponentName: common.ComponentNameProxyServer,
+					},
+				},
+			},
+		}
 	}
 	specHash, err := proxyServerSpecHash(deployment.Spec)
 	if err != nil {
