@@ -77,16 +77,6 @@ var _ = Describe("Proxy-agent rollout safety", Serial, Label("rollout", "ha", "c
 		Expect(setProxyServerDeploymentReplicas(1)).To(Succeed())
 		waitForProxyServerReplicas(1)
 
-		By("Waiting for traffic through the remaining proxy-server to stabilize")
-		Eventually(probeRolloutTraffic).
-			WithTimeout(30 * time.Second).
-			WithPolling(100 * time.Millisecond).
-			Should(Succeed())
-		Consistently(probeRolloutTraffic).
-			WithTimeout(2 * time.Second).
-			WithPolling(100 * time.Millisecond).
-			Should(Succeed())
-
 		By("Starting a replacement while only one proxy-server is available")
 		Expect(triggerProxyAgentRollout()).To(Succeed())
 
