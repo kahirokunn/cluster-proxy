@@ -44,6 +44,7 @@ import (
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
 	"open-cluster-management.io/cluster-proxy/pkg/proxyserver/operator/authentication/selfsigned"
+	"open-cluster-management.io/cluster-proxy/pkg/util"
 )
 
 var (
@@ -110,6 +111,51 @@ func TestMergeAndNormalizeValuesFuncs(t *testing.T) {
 		_, err := getValues(nil, nil)
 		assert.ErrorContains(t, err, "failed to normalize Helm values:")
 	})
+}
+
+func TestNormalizeAdditionalProxyAgentArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		want    []string
+		wantErr string
+	}{
+		{
+			name: "canonical equals forms",
+			args: []string{"--v=4", "--health-server-port=8093", "--health-server-host=", "--ca-cert=/etc/ca/ca.crt", "--agent-cert=/etc/tls/tls.crt", "--agent-key=/etc/tls/tls.key", "--sync-interval=5m"},
+			want: []string{"--v=4", "--sync-interval=5m"},
+		},
+		{
+			name: "canonical split forms",
+			args: []string{"--health-server-port", "8093", "--health-server-host", "", "--ca-cert", "/etc/ca/ca.crt", "--agent-cert", "/etc/tls/tls.crt", "--agent-key", "/etc/tls/tls.key"},
+			want: []string{},
+		},
+		{name: "conflicting value", args: []string{"--health-server-port=18093"}, wantErr: "conflicts with controller-owned value"},
+		{name: "missing value", args: []string{"--agent-cert", "--v=4"}, wantErr: "missing its value"},
+		{name: "unrelated order preserved", args: []string{"--v=4", "value", "--sync-interval=5m"}, want: []string{"--v=4", "value", "--sync-interval=5m"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeAdditionalProxyAgentArgs(tt.args)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestToAgentAddOnChartValuesRejectsHealthPortOverride(t *testing.T) {
+	config := addonv1beta1.AddOnDeploymentConfig{
+		Spec: addonv1beta1.AddOnDeploymentConfigSpec{
+			CustomizedVariables: []addonv1beta1.CustomizedVariable{{Name: "proxyAgentHealthPort", Value: "8094"}},
+		},
+	}
+	_, err := toAgentAddOnChartValues(nil)(config)
+	assert.ErrorContains(t, err, "controller-owned")
 }
 
 func TestRemoveDupAndSortservicesToExpose(t *testing.T) {
@@ -513,6 +559,66 @@ func TestNewAgentAddon(t *testing.T) {
 					for _, arg := range serviceProxy.Args {
 						assert.NotContains(t, arg, "--oidc-")
 					}
+				}
+			},
+		},
+		{
+			name:    "scalar-looking additional args remain strings",
+			cluster: newCluster(clusterName, true),
+			addon: func() *addonv1beta1.ManagedClusterAddOn {
+				addOn := newAddOn(addOnName, clusterName)
+				addOn.Status.ConfigReferences = []addonv1beta1.ConfigReference{newManagedProxyConfigReference(managedProxyConfigName)}
+				return addOn
+			}(),
+			managedProxyConfig: func() runtimeclient.Object {
+				config := newManagedProxyConfig(managedProxyConfigName, proxyv1alpha1.EntryPointTypePortForward)
+				config.Spec.ProxyAgent.AdditionalArgs = []string{
+					"--v", "4",
+					"--admin-bind-address", "",
+				}
+				config.Spec.ProxyAgent.AdditionalServiceProxyArgs = []string{
+					"--max-idle-conns", "4",
+					"--additional-service-ca", "",
+				}
+				return config
+			}(),
+			addOndDeploymentConfigs: []runtime.Object{},
+			kubeObjs:                []runtime.Object{},
+			enableKubeApiProxy:      true,
+			enableServiceProxy:      true,
+			verifyManifests: func(t *testing.T, manifests []runtime.Object) {
+				agentDeploy := getAgentDeployment(manifests)
+				if !assert.NotNil(t, agentDeploy) {
+					return
+				}
+
+				proxyAgent := getDeploymentContainer(agentDeploy, "proxy-agent")
+				if assert.NotNil(t, proxyAgent) {
+					serviceProxyHost := util.GenerateServiceProxyHost(clusterName)
+					assert.Equal(t, []string{
+						"--proxy-server-host=127.0.0.1",
+						"--proxy-server-port=8091",
+						"--agent-identifiers=host=" + serviceProxyHost + "&host=" + clusterName + "&host=" + clusterName + "." + addOnName,
+						"--ca-cert=/etc/ca/ca.crt",
+						"--agent-cert=/etc/tls/tls.crt",
+						"--agent-key=/etc/tls/tls.key",
+						"--health-server-port=8093",
+						"--v", "4",
+						"--admin-bind-address", "",
+					}, proxyAgent.Args)
+				}
+
+				serviceProxy := getDeploymentContainer(agentDeploy, "service-proxy")
+				if assert.NotNil(t, serviceProxy) {
+					assert.Equal(t, []string{
+						"service-proxy",
+						"--enable-impersonation=true",
+						"--cert=/server-cert/tls.crt",
+						"--key=/server-cert/tls.key",
+						"--hub-kubeconfig=/etc/kubeconfig/kubeconfig",
+						"--max-idle-conns", "4",
+						"--additional-service-ca", "",
+					}, serviceProxy.Args)
 				}
 			},
 		},
@@ -1013,7 +1119,9 @@ func TestNewAgentAddon(t *testing.T) {
 				return
 			}
 			assert.NoError(t, err)
-			assertPodSecurityContext(t, getAgentDeployment(manifests))
+			agentDeployment := getAgentDeployment(manifests)
+			assertPodSecurityContext(t, agentDeployment)
+			assertContainerProbeMatrix(t, agentDeployment, c.enableServiceProxy)
 			c.verifyManifests(t, manifests)
 		})
 	}
@@ -1163,6 +1271,59 @@ func TestImpersonationRBACConfiguration(t *testing.T) {
 			assert.Equal(t, test.wantImpersonation,
 				clusterRoleAllowsImpersonation(getClusterRole(manifests, "cluster-proxy-addon-agent-impersonator")))
 		})
+	}
+}
+
+func assertContainerProbeMatrix(t *testing.T, deploy *appsv1.Deployment, serviceProxyEnabled bool) {
+	t.Helper()
+	if !assert.NotNil(t, deploy) {
+		return
+	}
+	assertHTTPProbe := func(containerName string, probe *corev1.Probe, path string, port, initialDelay, period, timeout, failure int32) {
+		t.Helper()
+		if !assert.NotNil(t, probe, "%s probe", containerName) ||
+			!assert.NotNil(t, probe.HTTPGet, "%s HTTP probe", containerName) {
+			return
+		}
+		assert.Equal(t, path, probe.HTTPGet.Path)
+		assert.Equal(t, port, probe.HTTPGet.Port.IntVal)
+		assert.Equal(t, corev1.URISchemeHTTP, probe.HTTPGet.Scheme)
+		assert.Nil(t, probe.TCPSocket)
+		assert.Nil(t, probe.Exec)
+		assert.Equal(t, initialDelay, probe.InitialDelaySeconds)
+		assert.Equal(t, period, probe.PeriodSeconds)
+		assert.Equal(t, timeout, probe.TimeoutSeconds)
+		assert.Equal(t, failure, probe.FailureThreshold)
+	}
+
+	proxyAgent := getDeploymentContainer(deploy, "proxy-agent")
+	if assert.NotNil(t, proxyAgent) {
+		assertHTTPProbe("proxy-agent liveness", proxyAgent.LivenessProbe, "/proxy-agent-healthz", 8888, 10, 10, 2, 1)
+		assertHTTPProbe("proxy-agent readiness", proxyAgent.ReadinessProbe, "/readyz", proxyAgentHealthPort, 5, 2, 1, 1)
+		assert.Nil(t, proxyAgent.StartupProbe)
+		assert.Contains(t, proxyAgent.Args, "--health-server-port=8093")
+	}
+	addonAgent := getDeploymentContainer(deploy, "addon-agent")
+	if assert.NotNil(t, addonAgent) {
+		assertHTTPProbe("addon-agent liveness", addonAgent.LivenessProbe, "/healthz", 8888, 10, 10, 2, 3)
+		assertHTTPProbe("addon-agent readiness", addonAgent.ReadinessProbe, "/readyz", 8888, 5, 2, 1, 1)
+		assert.Nil(t, addonAgent.StartupProbe)
+		assert.Contains(t, addonAgent.Args, "--proxy-agent-health-port=8093")
+		assert.Contains(t, addonAgent.VolumeMounts, corev1.VolumeMount{
+			Name:      "ca",
+			MountPath: "/etc/ca",
+			ReadOnly:  true,
+		})
+	}
+	serviceProxy := getDeploymentContainer(deploy, "service-proxy")
+	if !serviceProxyEnabled {
+		assert.Nil(t, serviceProxy)
+		return
+	}
+	if assert.NotNil(t, serviceProxy) {
+		assertHTTPProbe("service-proxy liveness", serviceProxy.LivenessProbe, "/healthz", 8000, 10, 10, 2, 3)
+		assertHTTPProbe("service-proxy readiness", serviceProxy.ReadinessProbe, "/readyz", 8000, 5, 2, 1, 1)
+		assert.Nil(t, serviceProxy.StartupProbe)
 	}
 }
 
