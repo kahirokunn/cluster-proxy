@@ -457,11 +457,13 @@ func TestNewAgentAddon(t *testing.T) {
 			kubeObjs:                []runtime.Object{},
 			enableKubeApiProxy:      true,
 			verifyManifests: func(t *testing.T, manifests []runtime.Object) {
-				assert.Len(t, manifests, len(expectedManifestNames))
-				assert.ElementsMatch(t, expectedManifestNames, manifestNames(manifests))
+				expected := append(append([]string{}, expectedManifestNames...), "cluster-proxy-proxy-agent")
+				assert.Len(t, manifests, len(expected))
+				assert.ElementsMatch(t, expected, manifestNames(manifests))
 				agentDeploy := getAgentDeployment(manifests)
 				assert.NotNil(t, agentDeploy)
 				assert.Equal(t, *agentDeploy.Spec.Replicas, int32(2))
+				assert.Len(t, agentDeploy.Spec.Template.Spec.TopologySpreadConstraints, 1)
 			},
 		},
 		{
@@ -712,11 +714,13 @@ func TestNewAgentAddon(t *testing.T) {
 				addonv1beta1.CustomizedVariable{Name: "replicas", Value: "10"})},
 			enableKubeApiProxy: true,
 			verifyManifests: func(t *testing.T, manifests []runtime.Object) {
-				assert.Len(t, manifests, len(expectedManifestNames))
-				assert.ElementsMatch(t, expectedManifestNames, manifestNames(manifests))
+				expected := append(append([]string{}, expectedManifestNames...), "cluster-proxy-proxy-agent")
+				assert.Len(t, manifests, len(expected))
+				assert.ElementsMatch(t, expected, manifestNames(manifests))
 				agentDeploy := getAgentDeployment(manifests)
 				assert.NotNil(t, agentDeploy)
 				assert.Equal(t, int32(10), *agentDeploy.Spec.Replicas)
+				assert.Len(t, agentDeploy.Spec.Template.Spec.TopologySpreadConstraints, 1)
 			},
 		},
 		{

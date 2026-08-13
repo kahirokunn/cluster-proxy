@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
@@ -101,6 +102,38 @@ func TestNewProxyServerDeployment_SetsPodSecurityContext(t *testing.T) {
 	}
 	assert.Equal(t, expected, deploy.Spec.Template.Spec.SecurityContext)
 	assert.NotEmpty(t, deploy.Annotations[common.AnnotationKeyProxyServerSpecHash])
+}
+
+func TestNewProxyServerDeployment_UsesRollingUpdate(t *testing.T) {
+	deploy, err := newProxyServerDeployment(newTestConfig(1), "IfNotPresent", nil)
+	if err != nil {
+		t.Fatalf("unexpected deployment error: %v", err)
+	}
+
+	assert.Equal(t, "RollingUpdate", string(deploy.Spec.Strategy.Type))
+	if deploy.Spec.Strategy.RollingUpdate == nil {
+		t.Fatal("rolling update settings are nil")
+	}
+	assert.Equal(t, intstr.FromInt(0), *deploy.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	assert.Equal(t, intstr.FromInt(1), *deploy.Spec.Strategy.RollingUpdate.MaxSurge)
+	assert.Empty(t, deploy.Spec.Template.Spec.TopologySpreadConstraints)
+}
+
+func TestNewProxyServerDeployment_SpreadsMultipleReplicas(t *testing.T) {
+	deploy, err := newProxyServerDeployment(newTestConfig(2), "IfNotPresent", nil)
+	if err != nil {
+		t.Fatalf("unexpected deployment error: %v", err)
+	}
+
+	if len(deploy.Spec.Template.Spec.TopologySpreadConstraints) != 1 {
+		t.Fatalf("unexpected topology spread constraint count: got %d, want 1", len(deploy.Spec.Template.Spec.TopologySpreadConstraints))
+	}
+	constraint := deploy.Spec.Template.Spec.TopologySpreadConstraints[0]
+	assert.Equal(t, corev1.LabelHostname, constraint.TopologyKey)
+	assert.Equal(t, corev1.ScheduleAnyway, constraint.WhenUnsatisfiable)
+	assert.Equal(t, map[string]string{
+		common.LabelKeyComponentName: common.ComponentNameProxyServer,
+	}, constraint.LabelSelector.MatchLabels)
 }
 
 func TestProxyServerSpecHashChangesWithPodSpec(t *testing.T) {
