@@ -309,7 +309,8 @@ type ManagedProxyConfigurationProxyAgent struct {
 	// +optional
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas"`
-	// `additionalArgs` defines args used in proxy-agent.
+	// `additionalArgs` defines args used in proxy-agent. Health listener and certificate path flags are
+	// controller-owned; redundant canonical values are accepted, while conflicting values are rejected.
 	// +optional
 	AdditionalArgs []string `json:"additionalArgs,omitempty"`
 	// `additionalServiceProxyArgs` defines additional args used in proxy-agent for proxying services.
