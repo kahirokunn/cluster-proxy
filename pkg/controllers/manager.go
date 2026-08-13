@@ -15,6 +15,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/textlogger"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -96,6 +97,12 @@ func runControllerManager(ctx context.Context) error {
 	if err != nil {
 		klog.Error(err, "unable to set up overall controller manager")
 		return fmt.Errorf("set up controller manager: %w", err)
+	}
+	if healthCheckErr := mgr.AddHealthzCheck("healthz", healthz.Ping); healthCheckErr != nil {
+		return fmt.Errorf("set up health check: %w", healthCheckErr)
+	}
+	if readinessCheckErr := mgr.AddReadyzCheck("readyz", healthz.Ping); readinessCheckErr != nil {
+		return fmt.Errorf("set up readiness check: %w", readinessCheckErr)
 	}
 
 	// loading ManagedProxyConfiguration for owner reference

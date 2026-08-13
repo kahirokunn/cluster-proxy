@@ -4,13 +4,16 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -56,6 +59,8 @@ func NewUserServerCommand() *cobra.Command {
 var (
 	serviceProxyRootCA *x509.CertPool
 )
+
+const userServerTLSHealthCheckTimeout = 500 * time.Millisecond
 
 type userServer struct {
 	// TODO: make it a controller and reuse tunnel for each cluster to improve performance.
@@ -121,6 +126,27 @@ func (k *userServer) Validate() error {
 
 func newUserServer() *userServer {
 	return &userServer{}
+}
+
+func serverNameForCertificate(certificate *x509.Certificate) (string, error) {
+	for _, ip := range certificate.IPAddresses {
+		serverName := ip.String()
+		if err := certificate.VerifyHostname(serverName); err == nil {
+			return serverName, nil
+		}
+	}
+
+	for _, dnsName := range certificate.DNSNames {
+		serverName := dnsName
+		if suffix, ok := strings.CutPrefix(dnsName, "*."); ok {
+			serverName = "tls-health-check." + suffix
+		}
+		if err := certificate.VerifyHostname(serverName); err == nil {
+			return serverName, nil
+		}
+	}
+
+	return "", errors.New("user server certificate has no usable DNS or IP subject alternative name")
 }
 
 func (k *userServer) init(ctx context.Context) error {
@@ -278,13 +304,47 @@ func (k *userServer) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to create config checker: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
-		MinVersion:   sdkTLSConfig.MinVersion,
-		CipherSuites: sdkTLSConfig.CipherSuites,
+	serverCertificate, err := tls.LoadX509KeyPair(k.serverCert, k.serverKey)
+	if err != nil {
+		return fmt.Errorf("failed to load user server certificate: %w", err)
+	}
+	if len(serverCertificate.Certificate) == 0 {
+		return errors.New("user server certificate chain is empty")
+	}
+	serverLeafCertificate, err := x509.ParseCertificate(serverCertificate.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("failed to parse user server certificate: %w", err)
+	}
+	serverCertificate.Leaf = serverLeafCertificate
+	serverName, err := serverNameForCertificate(serverLeafCertificate)
+	if err != nil {
+		return err
 	}
 
-	checks := map[string]healthz.Checker{"config-checksum": cc.Check}
-	healthServer := utils.NewHealthProbeServer(":8000", checks, checks)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		MinVersion:   sdkTLSConfig.MinVersion,
+		CipherSuites: append([]uint16(nil), sdkTLSConfig.CipherSuites...),
+	}
+
+	livenessChecks := map[string]healthz.Checker{
+		"config-checksum": cc.Check,
+	}
+	readinessChecks := make(map[string]healthz.Checker, len(livenessChecks)+1)
+	maps.Copy(readinessChecks, livenessChecks)
+	serverRootCAs := x509.NewCertPool()
+	serverRootCAs.AddCert(serverLeafCertificate)
+	healthTLSConfig := tlsConfig.Clone()
+	healthTLSConfig.Certificates = nil
+	healthTLSConfig.RootCAs = serverRootCAs
+	healthTLSConfig.ServerName = serverName
+	readinessChecks["user-server-tls"] = utils.NewTLSHealthChecker(
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(k.serverPort)),
+		healthTLSConfig,
+		userServerTLSHealthCheckTimeout,
+	)
+
+	healthServer := utils.NewHealthProbeServer(":8000", livenessChecks, readinessChecks)
 	publicServer := utils.NewProxyHTTPServer(fmt.Sprintf(":%d", k.serverPort), tlsConfig, k)
 
 	klog.Infof("starting user HTTPS server on %d and health server on 8000", k.serverPort)
