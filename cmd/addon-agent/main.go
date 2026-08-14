@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,12 +32,13 @@ import (
 )
 
 var (
-	hubKubeconfig               string
-	clusterName                 string
-	proxyServerNamespace        string
-	enablePortForwardProxy      bool
-	enableProxyAgentHealthCheck bool
-	proxyAgentHealthPort        int
+	hubKubeconfig                  string
+	clusterName                    string
+	proxyServerNamespace           string
+	enablePortForwardProxy         bool
+	enableProxyAgentHealthCheck    bool
+	proxyAgentHealthPort           int
+	expectedProxyServerConnections int
 )
 
 // envKeyPodNamespace represents the environment variable key for the addon agent namespace.
@@ -41,10 +48,12 @@ const envKeyPodNamespace = "POD_NAMESPACE"
 // The addon-agent and proxy-agent containers run in the same Pod and share the network namespace,
 // so we can access the proxy-agent's health server via localhost.
 const (
-	defaultProxyAgentHealthPort = 8093
-	healthProbeAddress          = ":8888"
-	healthCheckTimeout          = time.Second
-	healthShutdownTimeout       = 5 * time.Second
+	defaultProxyAgentHealthPort           = 8093
+	healthProbeAddress                    = ":8888"
+	healthCheckTimeout                    = time.Second
+	healthShutdownTimeout                 = 5 * time.Second
+	proxyAgentOpenServerConnectionsMetric = "konnectivity_network_proxy_agent_open_server_connections"
+	maxProxyAgentMetricsBodyBytes         = 1 << 20
 )
 
 // checkProxyAgentReadiness returns a health check function that checks if the proxy-agent
@@ -86,6 +95,8 @@ func main() {
 		"If true, check proxy-agent connection status before updating lease")
 	flag.IntVar(&proxyAgentHealthPort, "proxy-agent-health-port", defaultProxyAgentHealthPort,
 		"The local proxy-agent health server port")
+	flag.IntVar(&expectedProxyServerConnections, "expected-proxy-server-connections", 1,
+		"Number of proxy-server connections required before the proxy-agent startup probe succeeds")
 	flag.Parse()
 
 	// pipe controller-runtime logs to klog
@@ -97,6 +108,9 @@ func main() {
 
 func run(ctx context.Context) error {
 	if err := validateProxyAgentHealthPort(proxyAgentHealthPort); err != nil {
+		return err
+	}
+	if err := validateExpectedProxyServerConnections(expectedProxyServerConnections); err != nil {
 		return err
 	}
 
@@ -153,6 +167,11 @@ func run(ctx context.Context) error {
 		serializedChecker(cc.Check),
 		newHTTPHealthChecker("http://"+proxyAgentHealthAddress+"/healthz", healthCheckTimeout),
 		portForwardReadinessChecker(readiness),
+		checkProxyAgentStartup(
+			newProxyAgentMetricsClient(),
+			"http://"+proxyAgentHealthAddress+"/metrics",
+			expectedProxyServerConnections,
+		),
 	)
 	healthServer, listener, err := newHealthProbeServer(healthProbeAddress, healthHandler)
 	if err != nil {
@@ -192,13 +211,23 @@ func validateProxyAgentHealthPort(port int) error {
 	return nil
 }
 
-func newHealthProbeHandler(certificates, proxyAgent, portForward healthz.Checker) http.Handler {
+func validateExpectedProxyServerConnections(expected int) error {
+	if expected < 0 || expected > math.MaxInt32 {
+		return fmt.Errorf("expected-proxy-server-connections must be between 0 and %d, got %d", math.MaxInt32, expected)
+	}
+	return nil
+}
+
+func newHealthProbeHandler(certificates, proxyAgent, portForward, startup healthz.Checker) http.Handler {
 	mux := http.NewServeMux()
 	mountHealthHandler(mux, "/healthz", map[string]healthz.Checker{"ping": healthz.Ping})
 	mountHealthHandler(mux, "/readyz", map[string]healthz.Checker{"port-forward": portForward})
 	mountHealthHandler(mux, "/proxy-agent-healthz", map[string]healthz.Checker{
 		"certificates": certificates,
 		"proxy-agent":  proxyAgent,
+	})
+	mountHealthHandler(mux, "/startupz", map[string]healthz.Checker{
+		"proxy-agent-server-connections": startup,
 	})
 	return mux
 }
@@ -235,6 +264,145 @@ func newHTTPHealthChecker(url string, timeout time.Duration) healthz.Checker {
 		}
 		return nil
 	}
+}
+
+func newProxyAgentMetricsClient() *http.Client {
+	return &http.Client{
+		Timeout: healthCheckTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func checkProxyAgentStartup(client *http.Client, metricsURL string, expectedConnections int) healthz.Checker {
+	return func(request *http.Request) error {
+		if expectedConnections == 0 {
+			return nil
+		}
+
+		metricsRequest, err := http.NewRequestWithContext(request.Context(), http.MethodGet, metricsURL, http.NoBody)
+		if err != nil {
+			return fmt.Errorf("create proxy-agent metrics request: %w", err)
+		}
+
+		response, err := client.Do(metricsRequest)
+		if err != nil {
+			return fmt.Errorf("get proxy-agent metrics: %w", err)
+		}
+		defer response.Body.Close()
+
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("get proxy-agent metrics: unexpected HTTP status %d", response.StatusCode)
+		}
+
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxProxyAgentMetricsBodyBytes+1))
+		if err != nil {
+			return fmt.Errorf("read proxy-agent metrics: %w", err)
+		}
+		if len(body) > maxProxyAgentMetricsBodyBytes {
+			return fmt.Errorf("proxy-agent metrics response exceeds %d bytes", maxProxyAgentMetricsBodyBytes)
+		}
+
+		connections, err := parseOpenServerConnections(body)
+		if err != nil {
+			return err
+		}
+		if int(connections) < expectedConnections {
+			return fmt.Errorf("proxy-agent has %d open proxy-server connections, want at least %d", connections, expectedConnections)
+		}
+		return nil
+	}
+}
+
+func parseOpenServerConnections(metrics []byte) (int32, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(metrics))
+	scanner.Buffer(make([]byte, 64*1024), maxProxyAgentMetricsBodyBytes+1)
+
+	foundType := false
+	foundSample := false
+	var connections int32
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		targetType, err := parseOpenServerConnectionsType(fields)
+		if err != nil {
+			return 0, err
+		}
+		if targetType {
+			if foundType {
+				return 0, fmt.Errorf("proxy-agent metric %q has duplicate TYPE declarations", proxyAgentOpenServerConnectionsMetric)
+			}
+			foundType = true
+			continue
+		}
+
+		targetSample, value, err := parseOpenServerConnectionsSample(fields)
+		if err != nil {
+			return 0, err
+		}
+		if !targetSample {
+			continue
+		}
+		if foundSample {
+			return 0, fmt.Errorf("proxy-agent metric %q appears more than once", proxyAgentOpenServerConnectionsMetric)
+		}
+		connections = value
+		foundSample = true
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read proxy-agent metrics: %w", err)
+	}
+	if !foundType {
+		return 0, fmt.Errorf("proxy-agent metric %q is missing a gauge TYPE declaration", proxyAgentOpenServerConnectionsMetric)
+	}
+	if !foundSample {
+		return 0, fmt.Errorf("proxy-agent metric %q is missing", proxyAgentOpenServerConnectionsMetric)
+	}
+	return connections, nil
+}
+
+func parseOpenServerConnectionsType(fields []string) (bool, error) {
+	if len(fields) < 3 || fields[0] != "#" || fields[1] != "TYPE" || fields[2] != proxyAgentOpenServerConnectionsMetric {
+		return false, nil
+	}
+	if len(fields) != 4 {
+		return false, fmt.Errorf("proxy-agent metric %q has an invalid TYPE declaration", proxyAgentOpenServerConnectionsMetric)
+	}
+	if fields[3] != "gauge" {
+		return false, fmt.Errorf("proxy-agent metric %q has type %q, want gauge", proxyAgentOpenServerConnectionsMetric, fields[3])
+	}
+	return true, nil
+}
+
+func parseOpenServerConnectionsSample(fields []string) (matched bool, connections int32, err error) {
+	if len(fields) == 0 {
+		return false, 0, nil
+	}
+	if strings.HasPrefix(fields[0], proxyAgentOpenServerConnectionsMetric+"{") {
+		return false, 0, fmt.Errorf("proxy-agent metric %q must not have labels", proxyAgentOpenServerConnectionsMetric)
+	}
+	if fields[0] != proxyAgentOpenServerConnectionsMetric {
+		return false, 0, nil
+	}
+	if len(fields) < 2 || len(fields) > 3 {
+		return false, 0, fmt.Errorf("proxy-agent metric %q has an invalid sample", proxyAgentOpenServerConnectionsMetric)
+	}
+	if len(fields) == 3 {
+		if _, parseErr := strconv.ParseInt(fields[2], 10, 64); parseErr != nil {
+			return false, 0, fmt.Errorf("proxy-agent metric %q has invalid timestamp %q", proxyAgentOpenServerConnectionsMetric, fields[2])
+		}
+	}
+
+	value, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value != math.Trunc(value) || value > math.MaxInt32 {
+		return false, 0, fmt.Errorf("proxy-agent metric %q has invalid value %q", proxyAgentOpenServerConnectionsMetric, fields[1])
+	}
+	return true, int32(value), nil
 }
 
 func portForwardReadinessChecker(readiness *atomic.Value) healthz.Checker {
