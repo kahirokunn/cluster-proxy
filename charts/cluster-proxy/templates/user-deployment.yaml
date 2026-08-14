@@ -46,6 +46,24 @@ spec:
             privileged: false
             runAsNonRoot: true
             readOnlyRootFilesystem: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 1
         - name: user-server
           image: {{ $clusterProxyImage }}
           imagePullPolicy: IfNotPresent
@@ -80,13 +98,20 @@ spec:
             httpGet:
               path: /healthz
               port: 8000
-            initialDelaySeconds: 2
+              scheme: HTTP
+            initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8000
+              scheme: HTTP
+            initialDelaySeconds: 5
             periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 1
           volumeMounts:
             - name: user-tls-vol
               mountPath: /user-tls

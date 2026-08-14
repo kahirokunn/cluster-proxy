@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
@@ -16,7 +18,12 @@ import (
 	sdktls "open-cluster-management.io/sdk-go/pkg/tls"
 )
 
-const signerSecretName = "proxy-server-ca"
+const (
+	signerSecretName             = "proxy-server-ca"
+	defaultProxyServerHealthPort = int32(8092)
+	minimumProxyServerHealthPort = int32(1024)
+	maximumProxyServerHealthPort = int32(49151)
+)
 
 func newOwnerReference(config *proxyv1alpha1.ManagedProxyConfiguration) metav1.OwnerReference {
 	return metav1.OwnerReference{
@@ -82,7 +89,16 @@ func newProxyService(config *proxyv1alpha1.ManagedProxyConfiguration) *corev1.Se
 	}
 }
 
-func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, imagePullPolicy string, tlsConfig *sdktls.TLSConfig) *appsv1.Deployment {
+func newProxyServerDeployment(
+	config *proxyv1alpha1.ManagedProxyConfiguration,
+	imagePullPolicy string,
+	tlsConfig *sdktls.TLSConfig,
+) (*appsv1.Deployment, error) {
+
+	if err := validateProxyServerHealthConfiguration(config); err != nil {
+		return nil, err
+	}
+	healthPort := effectiveProxyServerHealthPort(config)
 	deployAnnotations := map[string]string{}
 	if hash := tlsConfigHash(tlsConfig); hash != "" {
 		deployAnnotations[common.AnnotationKeyTLSConfigHash] = hash
@@ -144,6 +160,35 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 								ReadOnlyRootFilesystem:   ptr.To(true),
 								AllowPrivilegeEscalation: ptr.To(false),
 							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt32(healthPort),
+										Scheme: corev1.URISchemeHTTP,
+									},
+								},
+								InitialDelaySeconds: 10,
+								PeriodSeconds:       10,
+								TimeoutSeconds:      2,
+								FailureThreshold:    3,
+							},
+							// Do not use the proxy server's native /readyz here. It requires an
+							// existing agent connection, while readiness-gated Service endpoints
+							// are the agents' bootstrap path to establish that connection.
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt32(healthPort),
+										Scheme: corev1.URISchemeHTTP,
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       2,
+								TimeoutSeconds:      1,
+								FailureThreshold:    1,
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "proxy-server-ca-certs",
@@ -194,7 +239,7 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 func newProxyServerRole(config *proxyv1alpha1.ManagedProxyConfiguration) *rbacv1.Role {
@@ -243,6 +288,7 @@ func proxyServerArgs(config *proxyv1alpha1.ManagedProxyConfiguration, tlsConfig 
 	args := append([]string{
 		"--server-count=" + strconv.Itoa(int(config.Spec.ProxyServer.Replicas)),
 		"--proxy-strategies=destHost",
+		"--health-port=" + strconv.Itoa(int(effectiveProxyServerHealthPort(config))),
 		"--server-ca-cert=/etc/server-ca-pki/ca.crt",
 		"--server-cert=/etc/server-pki/tls.crt",
 		"--server-key=/etc/server-pki/tls.key",
@@ -262,6 +308,34 @@ func proxyServerArgs(config *proxyv1alpha1.ManagedProxyConfiguration, tlsConfig 
 	}
 
 	return args
+}
+
+func effectiveProxyServerHealthPort(config *proxyv1alpha1.ManagedProxyConfiguration) int32 {
+	if config.Spec.Deploy != nil {
+		return config.Spec.Deploy.Ports.HealthServer
+	}
+	return defaultProxyServerHealthPort
+}
+
+func validateProxyServerHealthConfiguration(config *proxyv1alpha1.ManagedProxyConfiguration) error {
+	if healthPort := effectiveProxyServerHealthPort(config); healthPort < minimumProxyServerHealthPort || healthPort > maximumProxyServerHealthPort {
+		return fmt.Errorf("spec.deploy.ports.healthServer %d must be between %d and %d", healthPort, minimumProxyServerHealthPort, maximumProxyServerHealthPort)
+	}
+
+	for _, arg := range config.Spec.ProxyServer.AdditionalArgs {
+		flagName := arg
+		if index := strings.IndexByte(flagName, '='); index >= 0 {
+			flagName = flagName[:index]
+		}
+		switch flagName {
+		case "--health-port", "--health-bind-address":
+			return fmt.Errorf(
+				"proxyServer.additionalArgs must not set reserved flag %q; use spec.deploy.ports.healthServer",
+				flagName,
+			)
+		}
+	}
+	return nil
 }
 
 func tlsConfigHash(tlsConfig *sdktls.TLSConfig) string {
