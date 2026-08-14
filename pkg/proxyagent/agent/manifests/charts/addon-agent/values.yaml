@@ -30,6 +30,13 @@ additionalServiceProxyArgs: []
 # @schema const:8093
 proxyAgentHealthPort: 8093
 
+# Desired number of proxy-server connections required by the proxy-agent startup gate.
+# This value is controller-owned and comes from ManagedProxyConfiguration.
+# @schema type:integer
+# @schema minimum:0
+# @schema maximum:2147483647
+expectedProxyServerConnections: 1
+
 agentDeploymentAnnotations: {}
 
 # @schema item:string

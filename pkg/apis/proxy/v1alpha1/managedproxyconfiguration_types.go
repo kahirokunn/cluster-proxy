@@ -201,7 +201,9 @@ type ManagedProxyConfigurationProxyServer struct {
 	Image string `json:"image"`
 	// `replicas` is the expected replicas of the proxy servers.
 	// Note that the replicas will also be reflected in the flag `--server-count`
-	// so that agents can discover all the server instances.
+	// so that agents can discover all the server instances. A value of zero
+	// intentionally runs no proxy servers and disables the agent's connection-count
+	// startup gate until the value is increased again.
 	// +kubebuilder:default=3
 	// +optional
 	Replicas int32 `json:"replicas"`
@@ -302,7 +304,14 @@ type EntryPointHostname struct {
 // ManagedProxyConfigurationProxyAgent prescribes how to deploy agents to the managed
 // cluster.
 type ManagedProxyConfigurationProxyAgent struct {
-	// `image` is the container image of the proxy agent.
+	// `image` is the container image of the proxy agent. Custom images must expose
+	// `/healthz`, `/readyz`, and `/metrics` on the configured health port. After
+	// HTTP content decoding, the metrics response must be no larger than 1 MiB and
+	// contain exactly one zero-label
+	// `konnectivity_network_proxy_agent_open_server_connections` sample with a
+	// `# TYPE ... gauge` declaration. During an update, an incompatible replacement
+	// remains in startup so Kubernetes retains the previous available Pod and safely
+	// stops the rollout.
 	// +required
 	Image string `json:"image"`
 	// `replicas` is the replicas of the agents.
