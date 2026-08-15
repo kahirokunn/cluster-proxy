@@ -1,5 +1,34 @@
 {{- $clusterProxyImage := include "cluster-proxy-common.clusterProxyImage" . }}
 {{- $proxyAgentImage := include "cluster-proxy-common.proxyAgentImageOrDefault" . }}
+{{- $ownedProxyAgentArgs := dict "--health-server-port" "8093" "--health-server-host" "" "--ca-cert" "/etc/ca/ca.crt" "--agent-cert" "/etc/tls/tls.crt" "--agent-key" "/etc/tls/tls.key" }}
+{{- range $index, $rawArg := .Values.additionalProxyAgentArgs }}
+  {{- $arg := toString $rawArg }}
+  {{- $flagName := index (splitList "=" $arg) 0 }}
+  {{- if hasKey $ownedProxyAgentArgs $flagName }}
+    {{- $canonicalValue := get $ownedProxyAgentArgs $flagName }}
+    {{- $actualValue := "" }}
+    {{- if contains "=" $arg }}
+      {{- $actualValue = trimPrefix (printf "%s=" $flagName) $arg }}
+    {{- else }}
+      {{- $nextIndex := add $index 1 }}
+      {{- if ge $nextIndex (len $.Values.additionalProxyAgentArgs) }}
+        {{- fail (printf "additionalProxyAgentArgs flag %q is missing its value" $flagName) }}
+      {{- end }}
+      {{- $actualValue = toString (index $.Values.additionalProxyAgentArgs $nextIndex) }}
+      {{- if hasPrefix "--" $actualValue }}
+        {{- fail (printf "additionalProxyAgentArgs flag %q is missing its value" $flagName) }}
+      {{- end }}
+    {{- end }}
+    {{- if ne $actualValue $canonicalValue }}
+      {{- fail (printf "additionalProxyAgentArgs flag %q conflicts with controller-owned value %q" $flagName $canonicalValue) }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- range $arg := .Values.addonAgentArgs }}
+  {{- if regexMatch "^--proxy-agent-health-port(=|$)" (toString $arg) }}
+    {{- fail "addonAgentArgs must not override --proxy-agent-health-port" }}
+  {{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -67,8 +96,9 @@ spec:
             - --ca-cert=/etc/ca/ca.crt
             - --agent-cert=/etc/tls/tls.crt
             - --agent-key=/etc/tls/tls.key
+            - --health-server-port={{ .Values.proxyAgentHealthPort }}
             {{- range .Values.additionalProxyAgentArgs }}
-            - {{ . }}
+            - {{ . | quote }}
             {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -80,12 +110,22 @@ spec:
             readOnlyRootFilesystem: true
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /proxy-agent-healthz
               scheme: HTTP
               port: 8888
             initialDelaySeconds: 10
             failureThreshold: 1
             periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              scheme: HTTP
+              port: {{ .Values.proxyAgentHealthPort }}
+            initialDelaySeconds: 5
+            failureThreshold: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
           env:
             {{- if .Values.proxyConfig.HTTP_PROXY }}
             - name: HTTP_PROXY
@@ -124,8 +164,9 @@ spec:
           args:
             - --v=2
             {{- range .Values.addonAgentArgs }}
-            - {{ . }}
+            - {{ . | quote }}
             {{- end }}
+            - --proxy-agent-health-port={{ .Values.proxyAgentHealthPort }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -134,7 +175,28 @@ spec:
             privileged: false
             runAsNonRoot: true
             readOnlyRootFilesystem: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              scheme: HTTP
+              port: 8888
+            initialDelaySeconds: 10
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              scheme: HTTP
+              port: 8888
+            initialDelaySeconds: 5
+            failureThreshold: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
           volumeMounts:
+            - name: ca
+              mountPath: /etc/ca
+              readOnly: true
             - name: hub-kubeconfig
               mountPath: /etc/kubeconfig/
               readOnly: true
@@ -207,21 +269,28 @@ spec:
             {{- if .Values.oidcCAConfigMap }}
             - {{ printf "--oidc-ca-configmap=%s" .Values.oidcCAConfigMap | quote }}
             {{- end }}
-          {{- end }}
+            {{- end }}
             {{- range .Values.additionalServiceProxyArgs }}
-            - {{ . }}
+            - {{ . | quote }}
             {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
+              scheme: HTTP
               port: 8000
-            initialDelaySeconds: 2
+            initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /readyz
+              scheme: HTTP
               port: 8000
+            initialDelaySeconds: 5
             periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 1
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

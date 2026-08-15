@@ -6,13 +6,19 @@
   ],
   "properties": {
     "additionalProxyAgentArgs": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "additionalServiceProxyArgs": {
       "type": "array"
     },
     "addonAgentArgs": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "agentDeploymentAnnotations": {
       "type": "object"
@@ -119,6 +125,9 @@
     "oidcUsernamePrefix": {
       "description": "Prefix added to usernames. Empty uses the issuer URL for non-email claims; \"-\" disables prefixing.",
       "type": "string"
+    },
+    "proxyAgentHealthPort": {
+      "const": 8093
     },
     "proxyAgentImage": {
       "type": [

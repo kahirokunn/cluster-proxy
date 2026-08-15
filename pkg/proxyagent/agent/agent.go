@@ -41,6 +41,7 @@ const (
 	ManagedClusterConfigurationName = "cluster-proxy"
 
 	ProxyAgentSignerName = "open-cluster-management.io/proxy-agent-signer"
+	proxyAgentHealthPort = 8093
 
 	// serviceDomain must added because go dns client won't recursively search CNAME.
 	// See more details: https://coredns.io/manual/setups/#recursive-resolver; https://github.com/golang/go/blob/6f445a9db55f65e55c5be29d3c506ecf3be37915/src/net/dnsclient_unix.go#L666
@@ -53,7 +54,7 @@ func NewAgentAddon(
 	signerNamespace string,
 	runtimeClient client.Client,
 	nativeClient kubernetes.Interface,
-	enableKubeApiProxy bool, //nolint:revive // parameter name is part of the public API
+	enableKubeAPIProxy bool,
 	enableServiceProxy bool,
 	enableNetworkPolicies bool,
 	addonClient addonclient.Interface) (agent.AgentAddon, error) {
@@ -130,7 +131,7 @@ func NewAgentAddon(
 		WithAgentDeployTriggerClusterFilter(utils.ClusterImageRegistriesAnnotationChanged).
 		WithGetValuesFuncs(
 			mergeAndNormalizeValuesFuncs(
-				GetClusterProxyValueFunc(runtimeClient, nativeClient, signerNamespace, caCertData, enableKubeApiProxy),
+				GetClusterProxyValueFunc(runtimeClient, nativeClient, signerNamespace, caCertData, enableKubeAPIProxy),
 				GetClusterProxyAdditionalValueFunc(runtimeClient, nativeClient, signerNamespace, enableServiceProxy, enableNetworkPolicies),
 				addonfactory.GetAddOnDeploymentConfigValues(
 					utils.NewAddOnDeploymentConfigGetter(addonClient),
@@ -194,7 +195,7 @@ func GetClusterProxyValueFunc(
 	nativeClient kubernetes.Interface,
 	signerNamespace string,
 	caCertData []byte,
-	enableKubeApiProxy bool, //nolint:revive // parameter name is part of the public API
+	enableKubeAPIProxy bool,
 ) addonfactory.GetValuesFunc {
 	return func(cluster *clusterv1.ManagedCluster,
 		addon *addonv1beta1.ManagedClusterAddOn) (addonfactory.Values, error) {
@@ -202,6 +203,10 @@ func GetClusterProxyValueFunc(
 		if err := runtimeClient.Get(context.TODO(), types.NamespacedName{
 			Name: ManagedClusterConfigurationName,
 		}, proxyConfig); err != nil {
+			return nil, err
+		}
+		additionalProxyAgentArgs, err := normalizeAdditionalProxyAgentArgs(proxyConfig.Spec.ProxyAgent.AdditionalArgs)
+		if err != nil {
 			return nil, err
 		}
 
@@ -274,7 +279,7 @@ func GetClusterProxyValueFunc(
 		aids = append(aids, fmt.Sprintf("host=%s", serviceProxyHost))
 
 		// add default kube-apiserver agentIdentifiers
-		if enableKubeApiProxy {
+		if enableKubeAPIProxy {
 			aids = append(aids, fmt.Sprintf("host=%s", cluster.Name))
 			aids = append(aids, fmt.Sprintf("host=%s.%s", cluster.Name, namespace))
 		}
@@ -289,7 +294,7 @@ func GetClusterProxyValueFunc(
 			"serviceDomain":                serviceDomain,
 			"includeNamespaceCreation":     true,
 			"spokeAddonNamespace":          namespace,
-			"additionalProxyAgentArgs":     proxyConfig.Spec.ProxyAgent.AdditionalArgs,
+			"additionalProxyAgentArgs":     additionalProxyAgentArgs,
 			"additionalServiceProxyArgs":   proxyConfig.Spec.ProxyAgent.AdditionalServiceProxyArgs,
 			"clusterName":                  cluster.Name,
 			"registry":                     registry,
@@ -301,6 +306,7 @@ func GetClusterProxyValueFunc(
 			"base64EncodedCAData":          base64.StdEncoding.EncodeToString(caCertData),
 			"serviceEntryPoint":            serviceEntryPoint,
 			"serviceEntryPointPort":        serviceEntryPointPort,
+			"proxyAgentHealthPort":         proxyAgentHealthPort,
 			"agentDeploymentAnnotations":   annotations,
 			"addonAgentArgs":               addonAgentArgs,
 			"additionalServiceCAConfigMap": proxyConfig.Spec.ProxyAgent.AdditionalServiceCAConfigMap,
@@ -308,11 +314,42 @@ func GetClusterProxyValueFunc(
 			"agentIdentifiers":   agentIdentifiers,
 			"serviceProxyHost":   serviceProxyHost,
 			"servicesToExpose":   servicesToExpose,
-			"enableKubeApiProxy": enableKubeApiProxy,
+			"enableKubeApiProxy": enableKubeAPIProxy,
 		}
 
 		return values, nil
 	}
+}
+
+func normalizeAdditionalProxyAgentArgs(args []string) ([]string, error) {
+	canonicalValues := map[string]string{
+		"--health-server-port": strconv.Itoa(proxyAgentHealthPort),
+		"--health-server-host": "",
+		"--ca-cert":            "/etc/ca/ca.crt",
+		"--agent-cert":         "/etc/tls/tls.crt",
+		"--agent-key":          "/etc/tls/tls.key",
+	}
+	normalized := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		flagName, value, hasValue := strings.Cut(arg, "=")
+		canonicalValue, owned := canonicalValues[flagName]
+		if !owned {
+			normalized = append(normalized, arg)
+			continue
+		}
+		if !hasValue {
+			if index+1 >= len(args) || strings.HasPrefix(args[index+1], "--") {
+				return nil, fmt.Errorf("proxyAgent.additionalArgs flag %q is missing its value", flagName)
+			}
+			index++
+			value = args[index]
+		}
+		if value != canonicalValue {
+			return nil, fmt.Errorf("proxyAgent.additionalArgs flag %q conflicts with controller-owned value %q", flagName, canonicalValue)
+		}
+	}
+	return normalized, nil
 }
 
 type serviceToExpose struct {
@@ -360,6 +397,9 @@ func toAgentAddOnChartValues(caCertData []byte) func(config addonv1beta1.AddOnDe
 	return func(config addonv1beta1.AddOnDeploymentConfig) (addonfactory.Values, error) {
 		values := addonfactory.Values{}
 		for _, variable := range config.Spec.CustomizedVariables {
+			if variable.Name == "proxyAgentHealthPort" {
+				return nil, fmt.Errorf("customized variable %q is controller-owned and cannot be overridden", variable.Name)
+			}
 			values[variable.Name] = variable.Value
 		}
 

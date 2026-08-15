@@ -21,11 +21,18 @@ proxyAgentImagePullSecrets: []
 replicas: 1
 
 spokeAddonNamespace: "open-cluster-management-cluster-proxy"
+# @schema item:string
 additionalProxyAgentArgs: []
 additionalServiceProxyArgs: []
 
+# Internal shared health port for the proxy-agent and addon-agent containers.
+# @schema type:integer
+# @schema const:8093
+proxyAgentHealthPort: 8093
+
 agentDeploymentAnnotations: {}
 
+# @schema item:string
 addonAgentArgs: []
 
 serviceEntryPoint: ""
