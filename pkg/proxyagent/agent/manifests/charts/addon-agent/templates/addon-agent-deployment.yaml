@@ -221,7 +221,9 @@ spec:
             httpGet:
               path: /readyz
               port: 8000
+            initialDelaySeconds: 5
             periodSeconds: 2
+            failureThreshold: 1
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
