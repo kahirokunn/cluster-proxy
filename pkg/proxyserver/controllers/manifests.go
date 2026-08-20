@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
 	proxyv1alpha1 "open-cluster-management.io/cluster-proxy/pkg/apis/proxy/v1alpha1"
@@ -88,7 +89,7 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 		deployAnnotations[common.AnnotationKeyTLSConfigHash] = hash
 	}
 
-	return &appsv1.Deployment{
+	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: config.Spec.ProxyServer.Namespace,
 			Name:      config.Name,
@@ -108,7 +109,11 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 				},
 			},
 			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RecreateDeploymentStrategyType,
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: ptr.To(intstr.FromInt(0)),
+					MaxSurge:       ptr.To(intstr.FromInt(1)),
+				},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -195,6 +200,21 @@ func newProxyServerDeployment(config *proxyv1alpha1.ManagedProxyConfiguration, i
 			},
 		},
 	}
+	if config.Spec.ProxyServer.Replicas > 1 {
+		deployment.Spec.Template.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{
+			{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelHostname,
+				WhenUnsatisfiable: corev1.ScheduleAnyway,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						common.LabelKeyComponentName: common.ComponentNameProxyServer,
+					},
+				},
+			},
+		}
+	}
+	return deployment
 }
 
 func newProxyServerRole(config *proxyv1alpha1.ManagedProxyConfiguration) *rbacv1.Role {

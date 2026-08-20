@@ -25,7 +25,7 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `registry`                              | Registry used with `image` and `tag`                              | `quay.io/open-cluster-management`               |
 | `image`                                 | Cluster-proxy image name                                          | `cluster-proxy`                                 |
 | `tag`                                   | Cluster-proxy image tag                                           | `v<chart version>`                              |
-| `replicas`                              | Replicas for hub deployments                                      | `1`                                             |
+| `replicas`                              | Replicas for hub and managed-cluster workloads                    | `1`                                             |
 | `spokeAddonNamespace`                   | Default managed cluster addon namespace                           | `open-cluster-management-cluster-proxy`         |
 | `proxyServerImage`                      | Default apiserver-network-proxy server image                      | `quay.io/open-cluster-management/cluster-proxy` |
 | `proxyAgentImage`                       | Default apiserver-network-proxy agent image                       | `quay.io/open-cluster-management/cluster-proxy` |
@@ -42,6 +42,17 @@ helm install cluster-proxy ./charts/cluster-proxy \
 | `userServer.enabled`                    | Generate and rotate the user-server serving certificate          | `false`                                         |
 | `userServer.additionalSANs`             | Extra SANs for the generated user-server certificate             | `[]`                                            |
 | `networkPolicies.enabled`               | Create opt-in NetworkPolicies for hub and managed workloads       | `false`                                         |
+
+### Updates and optional high availability
+
+The default remains one replica. Proxy-server image and configuration changes
+use a standard Kubernetes rolling update while the stable Service continues to
+select ready proxy-server Pods. No custom rollout resource or second deployment
+slot is required.
+
+Set `replicas` to two or more to add best-effort hostname topology spreading and
+PodDisruptionBudgets for the hub and managed-cluster workloads. The chart omits
+those disruption budgets at the default single-replica setting.
 
 ### Service Proxy and User Server Configuration
 
