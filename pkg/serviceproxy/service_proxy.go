@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -137,7 +138,7 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	defer cancel()
 
 	var err error
-	customChecks := []healthz.Checker{}
+	livenessChecks := map[string]healthz.Checker{}
 	providerConfigFiles := s.authProviderConfigFiles()
 	configFiles := make([]string, 0, 3+len(providerConfigFiles))
 	configFiles = append(configFiles, s.cert, s.key, rootCAFile)
@@ -146,7 +147,7 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	customChecks = append(customChecks, cc.Check)
+	livenessChecks["config-checksum"] = cc.Check
 
 	if err := s.validate(); err != nil {
 		return err
@@ -163,7 +164,7 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		customChecks = append(customChecks, cc.Check)
+		livenessChecks["additional-service-ca-checksum"] = cc.Check
 	}
 
 	s.proxyTransport = s.newProxyTransport()
@@ -206,8 +207,35 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		MinVersion:   sdkTLSConfig.MinVersion,
 		CipherSuites: sdkTLSConfig.CipherSuites,
 	}
+	serverCertificate, err := tls.LoadX509KeyPair(s.cert, s.key)
+	if err != nil {
+		return fmt.Errorf("failed to load service proxy certificate: %w", err)
+	}
+	if len(serverCertificate.Certificate) == 0 {
+		return errors.New("service proxy certificate chain is empty")
+	}
+	serverLeafCertificate, err := x509.ParseCertificate(serverCertificate.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("failed to parse service proxy certificate: %w", err)
+	}
+	tlsConfig.Certificates = []tls.Certificate{serverCertificate}
 
-	healthServer := utils.NewHealthProbeServer(":8000", customChecks...)
+	servingCertRoots := x509.NewCertPool()
+	servingCertRoots.AddCert(serverLeafCertificate)
+	readinessChecks := make(map[string]healthz.Checker, len(livenessChecks)+1)
+	maps.Copy(readinessChecks, livenessChecks)
+	readinessChecks["service-proxy-tls"] = newTLSHealthChecker(
+		fmt.Sprintf("127.0.0.1:%d", constant.ServiceProxyPort),
+		&tls.Config{
+			MinVersion:   sdkTLSConfig.MinVersion,
+			CipherSuites: sdkTLSConfig.CipherSuites,
+			RootCAs:      servingCertRoots,
+			ServerName:   "127.0.0.1",
+		},
+		tlsHealthCheckTimeout,
+	)
+
+	healthServer := utils.NewHealthProbeServer(":8000", livenessChecks, readinessChecks)
 	publicServer := utils.NewProxyHTTPServer(fmt.Sprintf(":%d", constant.ServiceProxyPort), tlsConfig, s)
 
 	klog.Infof("starting service proxy HTTPS server on %d and health server on 8000", constant.ServiceProxyPort)

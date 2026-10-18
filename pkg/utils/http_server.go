@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -63,32 +64,35 @@ type HealthProbeServer struct {
 	ready atomic.Bool
 }
 
-// NewHealthProbeServer creates separate liveness and readiness endpoints.
-// Readiness only represents whether the proxy is accepting new traffic; the
-// existing config checks remain on the liveness endpoint.
-func NewHealthProbeServer(healthProbeBindAddress string, customChecks ...healthz.Checker) *HealthProbeServer {
+// NewHealthProbeServer creates separate liveness and readiness endpoints. The
+// optional check sets contain the independently named liveness and readiness
+// checks, in that order.
+func NewHealthProbeServer(
+	healthProbeBindAddress string,
+	checkSets ...map[string]healthz.Checker,
+) *HealthProbeServer {
 	healthServer := &HealthProbeServer{}
 	healthServer.ready.Store(true)
 
-	mux := http.NewServeMux()
-	checks := map[string]healthz.Checker{
-		"healthz-ping": healthz.Ping,
+	var livenessChecks, readinessChecks map[string]healthz.Checker
+	if len(checkSets) > 0 {
+		livenessChecks = checkSets[0]
 	}
-	for i, check := range customChecks {
-		checks[fmt.Sprintf("custom-healthz-checker-%d", i)] = check
+	if len(checkSets) > 1 {
+		readinessChecks = checkSets[1]
 	}
 
-	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: checks}))
-	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, _ *http.Request) {
-		if !healthServer.ready.Load() {
-			http.Error(writer, "draining", http.StatusServiceUnavailable)
-			return
-		}
-		writer.WriteHeader(http.StatusOK)
-	})
+	probeHandler := newHealthProbeHandler(livenessChecks, readinessChecks)
 	healthServer.Server = &http.Server{
-		Addr:              healthProbeBindAddress,
-		Handler:           mux,
+		Addr: healthProbeBindAddress,
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if (request.URL.Path == "/readyz" || strings.HasPrefix(request.URL.Path, "/readyz/")) &&
+				!healthServer.ready.Load() {
+				http.Error(writer, "draining", http.StatusServiceUnavailable)
+				return
+			}
+			probeHandler.ServeHTTP(writer, request)
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return healthServer

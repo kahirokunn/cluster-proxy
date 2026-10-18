@@ -508,6 +508,9 @@ func TestNewAgentAddon(t *testing.T) {
 						assert.NotNil(t, serviceProxy.ReadinessProbe.HTTPGet) {
 						assert.Equal(t, "/readyz", serviceProxy.ReadinessProbe.HTTPGet.Path)
 						assert.Equal(t, int32(8000), serviceProxy.ReadinessProbe.HTTPGet.Port.IntVal)
+						assert.Equal(t, int32(5), serviceProxy.ReadinessProbe.InitialDelaySeconds)
+						assert.Equal(t, int32(2), serviceProxy.ReadinessProbe.PeriodSeconds)
+						assert.Equal(t, int32(1), serviceProxy.ReadinessProbe.FailureThreshold)
 					}
 					// oidc flags must not be rendered when the oidc variables are unset
 					for _, arg := range serviceProxy.Args {
