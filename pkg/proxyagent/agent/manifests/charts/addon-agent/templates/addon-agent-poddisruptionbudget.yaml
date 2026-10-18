@@ -1,0 +1,14 @@
+{{- if gt (int .Values.replicas) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.agentDeploymentName }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      open-cluster-management.io/addon: cluster-proxy
+      proxy.open-cluster-management.io/component-name: proxy-agent
+{{- end }}
