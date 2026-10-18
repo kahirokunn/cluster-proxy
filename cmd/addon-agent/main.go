@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,7 @@ var (
 	proxyServerNamespace        string
 	enablePortForwardProxy      bool
 	enableProxyAgentHealthCheck bool
+	proxyAgentHealthPort        int
 )
 
 // envKeyPodNamespace represents the environment variable key for the addon agent namespace.
@@ -38,16 +40,21 @@ const envKeyPodNamespace = "POD_NAMESPACE"
 // proxyAgentHealthAddr is the address of the proxy-agent health server.
 // The addon-agent and proxy-agent containers run in the same Pod and share the network namespace,
 // so we can access the proxy-agent's health server via localhost.
-const proxyAgentHealthAddr = "localhost:8093"
+const (
+	defaultProxyAgentHealthPort = 8093
+	healthProbeAddress          = ":8888"
+	healthCheckTimeout          = time.Second
+	healthShutdownTimeout       = 5 * time.Second
+)
 
 // checkProxyAgentReadiness returns a health check function that checks if the proxy-agent
 // is connected to the proxy-server by querying the proxy-agent's /readyz endpoint.
 // Since both containers share the same network namespace within the Pod, this function
 // can reach the proxy-agent's health server at localhost:8093.
-func checkProxyAgentReadiness() func() bool {
+func checkProxyAgentReadiness(address string) func() bool {
 	client := &http.Client{Timeout: 5 * time.Second}
 	return func() bool {
-		resp, err := client.Get(fmt.Sprintf("http://%s/readyz", proxyAgentHealthAddr))
+		resp, err := client.Get(fmt.Sprintf("http://%s/readyz", address))
 		if err != nil {
 			klog.V(4).Infof("Failed to check proxy-agent readiness: %v", err)
 			return false
@@ -77,30 +84,46 @@ func main() {
 		"If true, running a local server forwarding tunnel shakes to proxy-server pods")
 	flag.BoolVar(&enableProxyAgentHealthCheck, "enable-proxy-agent-health-check", true,
 		"If true, check proxy-agent connection status before updating lease")
+	flag.IntVar(&proxyAgentHealthPort, "proxy-agent-health-port", defaultProxyAgentHealthPort,
+		"The local proxy-agent health server port")
 	flag.Parse()
 
 	// pipe controller-runtime logs to klog
 	ctrl.SetLogger(logger)
+	if err := run(ctrl.SetupSignalHandler()); err != nil {
+		klog.Fatalf("addon agent failed: %v", err)
+	}
+}
+
+func run(ctx context.Context) error {
+	if err := validateProxyAgentHealthPort(proxyAgentHealthPort); err != nil {
+		return err
+	}
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", hubKubeconfig)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	cfg.UserAgent = "proxy-agent-addon-agent"
 
-	spokeClient, err := kubernetes.NewForConfig(ctrl.GetConfigOrDie())
+	spokeConfig, err := ctrl.GetConfig()
 	if err != nil {
-		panic(fmt.Errorf("failed to create spoke client, err: %w", err))
+		return fmt.Errorf("get spoke config: %w", err)
+	}
+	spokeClient, err := kubernetes.NewForConfig(spokeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create spoke client: %w", err)
 	}
 	addonAgentNamespace := os.Getenv("POD_NAMESPACE")
 	if len(addonAgentNamespace) == 0 {
-		panic(fmt.Sprintf("Pod namespace is empty, please set the ENV for %s", envKeyPodNamespace))
+		return fmt.Errorf("pod namespace is empty, please set the ENV for %s", envKeyPodNamespace)
 	}
+	proxyAgentHealthAddress := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", proxyAgentHealthPort))
 
 	var healthCheckFuncs []func() bool
 	if enableProxyAgentHealthCheck {
 		klog.Infof("Proxy-agent health check enabled, lease will only update when proxy-agent is connected")
-		healthCheckFuncs = []func() bool{checkProxyAgentReadiness()}
+		healthCheckFuncs = []func() bool{checkProxyAgentReadiness(proxyAgentHealthAddress)}
 	}
 	leaseUpdater := lease.NewLeaseUpdater(
 		spokeClient,
@@ -109,10 +132,35 @@ func main() {
 		healthCheckFuncs...,
 	).WithHubLeaseConfig(cfg, clusterName)
 
-	ctx := context.Background()
-
 	readiness := &atomic.Value{}
 	readiness.Store(true)
+
+	// This checker intentionally lives only behind /proxy-agent-healthz. It is
+	// a one-shot restart trigger for the sibling proxy-agent container and must
+	// not make the add-on agent's own liveness or readiness fail.
+	cc, err := addonutils.NewConfigChecker(
+		"certificates check",
+		"/etc/ca/ca.crt",
+		"/etc/tls/tls.crt",
+		"/etc/tls/tls.key",
+	)
+	if err != nil {
+		return fmt.Errorf("create certificates checker: %w", err)
+	}
+	cc.SetReload(true)
+
+	healthHandler := newHealthProbeHandler(
+		serializedChecker(cc.Check),
+		newHTTPHealthChecker("http://"+proxyAgentHealthAddress+"/healthz", healthCheckTimeout),
+		portForwardReadinessChecker(readiness),
+	)
+	healthServer, listener, err := newHealthProbeServer(healthProbeAddress, healthHandler)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	stopPortForward := func() {}
 	if enablePortForwardProxy {
 		readiness.Store(false)
 		klog.Infof("Running local port-forward proxy")
@@ -123,60 +171,114 @@ func main() {
 			common.LabelKeyComponentName+"="+common.ComponentNameProxyServer,
 			8091,
 		)
-		_, err := rr.Listen(ctx)
+		stopPortForward, err = rr.Listen(ctx)
 		if err != nil {
-			panic(err)
+			return err
 		}
 	}
-
-	// If the certificates is changed, we need to restart the agent to load the new certificates.
-	cc, err := addonutils.NewConfigChecker("certificates check", "/etc/tls/tls.crt", "/etc/tls/tls.key")
-	if err != nil {
-		klog.Fatalf("failed create certificates checker: %v", err)
-	}
-	cc.SetReload(true)
-
-	go serveHealthProbes(ctx.Done(), ":8888", map[string]healthz.Checker{
-		"certificates": cc.Check,
-		"port forward proxy readiness": func(_ *http.Request) error {
-			if !readiness.Load().(bool) {
-				return fmt.Errorf("not ready")
-			}
-			return nil
-		},
-	})
+	defer stopPortForward()
 
 	klog.Infof("Starting lease updater")
-	leaseUpdater.Start(ctx)
-	<-ctx.Done()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go leaseUpdater.Start(runCtx)
+	return serveHealthProbes(runCtx, healthServer, listener)
 }
 
-// serveHealthProbes starts a server to check healthz and readyz probes
-func serveHealthProbes(stop <-chan struct{}, address string, healthCheckers map[string]healthz.Checker) {
+func validateProxyAgentHealthPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("proxy-agent-health-port must be between 1 and 65535, got %d", port)
+	}
+	return nil
+}
+
+func newHealthProbeHandler(certificates, proxyAgent, portForward healthz.Checker) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/healthz", http.StripPrefix("/healthz", &healthz.Handler{Checks: healthCheckers}))
+	mountHealthHandler(mux, "/healthz", map[string]healthz.Checker{"ping": healthz.Ping})
+	mountHealthHandler(mux, "/readyz", map[string]healthz.Checker{"port-forward": portForward})
+	mountHealthHandler(mux, "/proxy-agent-healthz", map[string]healthz.Checker{
+		"certificates": certificates,
+		"proxy-agent":  proxyAgent,
+	})
+	return mux
+}
 
-	server := http.Server{
-		Handler: mux,
+func mountHealthHandler(mux *http.ServeMux, basePath string, checks map[string]healthz.Checker) {
+	handler := http.StripPrefix(basePath, &healthz.Handler{Checks: checks})
+	mux.Handle(basePath, handler)
+	mux.Handle(basePath+"/", handler)
+}
+
+func serializedChecker(check healthz.Checker) healthz.Checker {
+	var mutex sync.Mutex
+	return func(request *http.Request) error {
+		mutex.Lock()
+		defer mutex.Unlock()
+		return check(request)
 	}
+}
 
-	ln, err := net.Listen("tcp", address)
-	if err != nil {
-		klog.Errorf("error listening on %s: %v", address, err)
-		return
-	}
-
-	klog.Infof("heath probes server is running...")
-	// Run server
-	go func() {
-		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			klog.Fatal(err)
+func newHTTPHealthChecker(url string, timeout time.Duration) healthz.Checker {
+	client := &http.Client{Timeout: timeout}
+	return func(request *http.Request) error {
+		req, err := http.NewRequestWithContext(request.Context(), http.MethodGet, url, nil)
+		if err != nil {
+			return err
 		}
+		response, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("check %s: %w", url, err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("check %s returned status %d", url, response.StatusCode)
+		}
+		return nil
+	}
+}
+
+func portForwardReadinessChecker(readiness *atomic.Value) healthz.Checker {
+	return func(_ *http.Request) error {
+		if !readiness.Load().(bool) {
+			return fmt.Errorf("port-forward proxy is not ready")
+		}
+		return nil
+	}
+}
+
+func newHealthProbeServer(address string, handler http.Handler) (*http.Server, net.Listener, error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen for health probes on %s: %w", address, err)
+	}
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}, listener, nil
+}
+
+func serveHealthProbes(ctx context.Context, server *http.Server, listener net.Listener) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		err := server.Serve(listener)
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		serveErr <- err
 	}()
 
-	// Shutdown the server when stop is closed
-	<-stop
-	if err := server.Shutdown(context.Background()); err != nil {
-		klog.Fatal(err)
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), healthShutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shut down health probe server: %w", err)
+	}
+	return <-serveErr
 }

@@ -140,7 +140,9 @@ spec:
                   proxy agents.'
                 properties:
                   additionalArgs:
-                    description: '`additionalArgs` defines args used in proxy-agent.'
+                    description: |-
+                      `additionalArgs` defines args used in proxy-agent. Health listener and certificate path flags are
+                      controller-owned; redundant canonical values are accepted, while conflicting values are rejected.
                     items:
                       type: string
                     type: array
